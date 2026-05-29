@@ -71,6 +71,22 @@ def _build_bch_table():
     return tbl
 _BCH_TBL = _build_bch_table()
 
+# Dense array form of the syndrome->error table for the njit hot-path core
+# (flexdec_numba). BCH syndrome is 11 bits; 0 = no correctable error (a valid
+# 1/2-bit pattern is nonzero, and a nonzero syndrome never arises from no-error,
+# so 0 is an unambiguous miss). Falls back to pure Python if numba is missing.
+_BCH_ARR = np.zeros(1 << (BCH_N - BCH_K + 1), dtype=np.int64)
+for _s, _e in _BCH_TBL.items():
+    _BCH_ARR[_s] = _e
+_REV8_ARR = np.array(_REV8, dtype=np.int64)
+try:
+    import os as _os
+    sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    from flexdec_numba import deint_decode_core as _deint_core
+    _HAVE_NUMBA = True
+except Exception:
+    _HAVE_NUMBA = False
+
 def bch3121(data):
     """returns (corrected_word, nerr) ; nerr in {0,1,2,-1(fail)}"""
     s = _syndrome(data)
@@ -596,6 +612,18 @@ def deinterleave_decode(bits, mag=None, chase=False, L=4):
     the local median margin is a likely miscorrection (status can't catch those).
     If chase and mag supplied, words that fail hard BCH are retried with Chase-II."""
     have_mag = mag is not None
+    if _HAVE_NUMBA and have_mag:
+        b = np.ascontiguousarray(bits, dtype=np.uint8)
+        m = np.ascontiguousarray(mag, dtype=np.float64)
+        ow, st, mg, nfail, ncorr, nchase = _deint_core(
+            b, m, bool(chase), int(L), _BCH_ARR, _REV8_ARR)
+        out = ow.tolist()
+        conf = [(int(st[k]), float(mg[k])) for k in range(st.shape[0])]
+        mvals = [mm for (_, mm) in conf if mm == mm]
+        med = float(np.median(mvals)) if mvals else 0.0
+        if med > 0:
+            conf = [(s, (mm / med if mm == mm else float("nan"))) for (s, mm) in conf]
+        return out, int(nfail), int(ncorr), int(nchase), conf
     out = []
     conf = []
     nfail = ncorr = nchase = 0

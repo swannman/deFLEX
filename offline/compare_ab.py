@@ -5,9 +5,13 @@ multimon source: mm_<off>.txt  FLEX_NEXT|...|ALN|...|<body> lines.
 Messages fragment differently between tools, so we normalize (collapse ws, lower,
 keep alnum+space) and report unique counts + fuzzy overlap (one normalized body
 is a substring of the other)."""
-import ast, re, sys
+import ast, os, re, sys
 from difflib import SequenceMatcher
-sys.path.insert(0, "/tmp/flex_ab")
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+# Shared core (flexdec.py) lives at the repo root; cover the flat install too.
+sys.path.insert(0, os.path.dirname(_HERE))
+sys.path.insert(0, _HERE)
 from flexdec import english_score   # same English gate flexdec uses
 
 RATIO = 0.80   # fuzzy-match threshold for clustering garbled near-duplicates

@@ -25,7 +25,11 @@ import sys
 import numpy as np
 from scipy import signal
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+# Shared core (flexdec.py / flexdec_numba.py) lives at the repo root; in the
+# flat /usr/local/bin install it sits beside this file -- cover both layouts.
+sys.path.insert(0, os.path.dirname(_HERE))
+sys.path.insert(0, _HERE)
 import flexdec as F
 
 # 250k samples per FLEX frame period (468750) -- the streaming quantum.

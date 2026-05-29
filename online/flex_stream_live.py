@@ -10,12 +10,15 @@ the two logs can be A/B'd over an identical RF window.
 
 Usage: flex_stream_live.py <iq_file> [in_rate] [run_seconds]
 """
+import os
 import sys
 import time
 import numpy as np
 
-sys.path.insert(0, "/tmp/flex_ab")
-sys.path.insert(0, "/tmp/pager-bindings")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+# flexdec_stream sits beside this file (online/); shared core at the repo root.
+sys.path.insert(0, os.path.dirname(_HERE))
+sys.path.insert(0, _HERE)
 import flexdec_stream as S
 
 ITEMSZ = 8   # complex64 = 8 bytes

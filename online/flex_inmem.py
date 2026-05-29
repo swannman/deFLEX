@@ -31,7 +31,12 @@ import numpy as np
 from gnuradio import gr, blocks, filter, soapy
 from gnuradio.filter import firdes
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+# flexdec_stream sits beside this file (online/); the shared core
+# (flexdec.py / flexdec_numba.py) is at the repo root. In the flat
+# /usr/local/bin install everything is co-located -- cover both layouts.
+sys.path.insert(0, os.path.dirname(_HERE))
+sys.path.insert(0, _HERE)
 import flexdec_stream as S
 import flexdec as F
 
@@ -151,7 +156,12 @@ class LiveGraph(gr.top_block):
         self.src.set_gain(0, "IFGR", 25)
         self.src.set_antenna(0, "Antenna A")
 
-        taps = firdes.low_pass(1.0, SAMP_RATE, 9000, 3000)
+        # Wide transition band on purpose: after decimate-by-DECIM the first
+        # alias folds in at IN_RATE-9000 ~= 241 kHz, so a 60 kHz transition still
+        # leaves huge guard. A 3 kHz transition forced ~2750 taps/carrier at the
+        # full 2.5 MS/s input rate -> 5 carriers saturated the 3-core budget and
+        # the SDR overran (continuous "O"), decoding nothing. ~137 taps fixes it.
+        taps = firdes.low_pass(1.0, SAMP_RATE, 9000, 60000)
         self.rings = {}
         self._blocks = []
         for carrier in CARRIERS:

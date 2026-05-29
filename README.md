@@ -192,6 +192,56 @@ acquisition, not better per-frame detection (which is already near-optimal).
 
 ---
 
+## Phase 2: wideband, all 7 production carriers (240 s)
+
+The 250 kS/s benchmark only contains one real carrier. To test all 7, a fresh
+**240 s / 2.646 MS/s** capture was taken at the production center (930.7625 MHz),
+then each carrier de-rotated to baseband via `--carrier` + `--samp-rate`
+(`load_baseband` resamples the wideband input down to the internal 250 kS/s, so
+the validated pipeline is untouched — `--samp-rate=250000` reproduces the
+benchmark result bit-for-bit).
+
+| Carrier (MHz) | Frames (of 127) | Trustworthy A+B | Note |
+|---|---|---|---|
+| 929.5875 | 0 | 0 | carried no decodable FLEX this window (lowest-power carrier) |
+| **929.6125** | 127 | **131** | strongest carrier |
+| 929.6625 | 127 | 2 | weak SNR off-center |
+| 929.9375 | 127 | 7 | |
+| 931.0625 | 0 | 0 | **POCSAG channel, not FLEX** — correctly skipped |
+| 931.2125 | 127 | 4 | |
+| 931.9375 | 127 | 19 | |
+
+**Findings:**
+
+- **Every page flexdec marks trustworthy is genuinely clean** — real
+  hospital/enterprise alpha across all five FLEX carriers (Harborview "Rapid
+  Response room 462", "ACTUAL EVENT … Full Trauma … ER 8", Epic EVS logistics,
+  UW "ready for turnover", door/alarm notifications).
+- **Calibration is near-perfect:** the count of readable bodies
+  (`--dump-readable`, en≥0.60 & ≥85% printable, any tier) ≈ the trustworthy A+B
+  count on every carrier → the large `C_suspect` bulk is genuinely garbled, not
+  hidden good text the tiering is throwing away.
+- **The two "0-frame" carriers are not flexdec failures:** 931.0625 is a POCSAG
+  channel (flexdec doesn't do POCSAG); 929.5875 simply had no decodable FLEX
+  traffic in the 4-minute window (a tighter LPF didn't recover it).
+- All active carriers are **mode 3** (3200 baud / 4-level), which flexdec
+  handles natively.
+
+**Fair A/B vs channelized multimon** (same English gate on both sides, plus
+`difflib` fuzzy clustering at ratio ≥0.80 to collapse garbled near-duplicates):
+raw distinct-message counts come out fd 96 / mm 126, but the multimon number is
+**inflated by its lack of FEC** — e.g. on 929.9375 its "18 distinct" is really
+~7 real messages + ~9 garbled copies of a single trauma alert (so corrupted they
+don't even cluster with each other) + 2 noise lines. flexdec's are clean and
+deduplicated.
+
+**Verdict:** comparable real-message recall, materially cleaner output. Yield
+tracks per-carrier SNR (2–131 trustworthy), but fidelity is uniformly excellent
+wherever signal exists — which is what matters for downstream
+machine-classification of bodies.
+
+---
+
 ## Usage
 
 ```bash

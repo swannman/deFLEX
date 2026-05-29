@@ -8,6 +8,7 @@ Usage: flexdec.py <cfile> [slicer] [--diag]
   slicer = fixed | perframe   (default perframe)
 """
 import sys
+from math import gcd
 import numpy as np
 from scipy import signal
 
@@ -113,13 +114,26 @@ def bch3121_chase(word, mag32, L=4):
     return best_cw, best_d
 
 # ---- front end ------------------------------------------------------------
-def load_baseband(cfile, cfo=0.0, lpf=12000.0):
-    """Read complex I/Q @ 250k, optional CFO de-rotation, channel LPF. Returns
-    the band-limited complex baseband (used both for FM demod and the MF bank)."""
+def load_baseband(cfile, cfo=0.0, lpf=12000.0, in_rate=None):
+    """Read complex I/Q, optional CFO de-rotation, channel LPF. Returns the
+    band-limited complex baseband (used both for FM demod and the MF bank).
+
+    `in_rate` is the file's sample rate. If it differs from the internal working
+    rate SAMP (250k), the channel is de-rotated to DC AT THE INPUT RATE first,
+    then polyphase-decimated down to SAMP -- so the rest of the (validated)
+    pipeline runs at exactly 250k regardless of capture bandwidth. This is how a
+    2.646 MS/s 7-carrier wideband file is decoded one carrier at a time:
+    --carrier is the offset (Hz) of the wanted channel from the file's center."""
     x = np.fromfile(cfile, dtype=np.complex64)
+    if in_rate is None:
+        in_rate = SAMP
     if cfo:
         n = np.arange(len(x))
-        x = x * np.exp(-2j * np.pi * cfo / SAMP * n)
+        x = x * np.exp(-2j * np.pi * cfo / in_rate * n)   # de-rotate at INPUT rate
+        cfo = 0.0                                          # already applied
+    if in_rate != SAMP:
+        g = gcd(int(round(in_rate)), SAMP)
+        x = signal.resample_poly(x, SAMP // g, int(round(in_rate)) // g)
     taps = signal.firwin(127, lpf / (SAMP / 2))     # +/- lpf Hz at 250 k
     return signal.lfilter(taps, 1.0, x)
 
@@ -134,8 +148,8 @@ def demod_from_baseband(xb, mf=True, mflen=SPB):
         d16 = np.convolve(d16, np.ones(mflen) / mflen, mode="same")
     return d16
 
-def front_end(cfile, cfo=0.0, mf=True, mflen=SPB, lpf=12000.0, return_baseband=False):
-    xb = load_baseband(cfile, cfo, lpf)
+def front_end(cfile, cfo=0.0, mf=True, mflen=SPB, lpf=12000.0, return_baseband=False, in_rate=None):
+    xb = load_baseband(cfile, cfo, lpf, in_rate=in_rate)
     d16 = demod_from_baseband(xb, mf, mflen)
     if return_baseband:
         return d16, xb
@@ -864,6 +878,8 @@ def main():
     mflen = SPB
     lpf = 12000.0
     carrier = 0.0          # channel-select offset (Hz) within the +-fs/2 capture band
+    in_rate = None         # input file sample rate (None -> assume SAMP=250k)
+    center_mhz = 929.6125  # display-only: capture center freq for labelling carriers
     for a in sys.argv:
         if a.startswith("--mflen="):
             mflen = int(a.split("=", 1)[1])
@@ -871,6 +887,10 @@ def main():
             lpf = float(a.split("=", 1)[1])
         if a.startswith("--carrier="):
             carrier = float(a.split("=", 1)[1])
+        if a.startswith("--samp-rate="):
+            in_rate = float(a.split("=", 1)[1])
+        if a.startswith("--center="):
+            center_mhz = float(a.split("=", 1)[1])
     mfbank = "--mfbank" in sys.argv             # Tier 1: 4-FSK matched-filter bank
     nocfo = "--nocfo" in sys.argv               # disable Tier 2 per-frame carrier null
     coh = "--coh" in sys.argv                   # Tier 3: coherent per-symbol phase track
@@ -887,9 +907,10 @@ def main():
     # with no new capture. The sync state machine auto-detects the channel's mode.
     if mfbank:
         demod, xb = front_end(cfile, cfo=carrier, mf=("--mf" in sys.argv), mflen=mflen,
-                              lpf=lpf, return_baseband=True)
+                              lpf=lpf, return_baseband=True, in_rate=in_rate)
     else:
-        demod = front_end(cfile, cfo=carrier, mf=("--mf" in sys.argv), mflen=mflen, lpf=lpf)
+        demod = front_end(cfile, cfo=carrier, mf=("--mf" in sys.argv), mflen=mflen, lpf=lpf,
+                          in_rate=in_rate)
     demod = demod - np.median(demod)            # global DC/CFO removal
     corr = "--corr" in sys.argv                  # continuous-tracking correlator acquisition
     corr_grid = "--corr-peaks" not in sys.argv   # comb all grid slots (vs only detected peaks)
@@ -1073,6 +1094,8 @@ def main():
             t = "C"
         return t
 
+    dump_readable = "--dump-readable" in sys.argv   # emit ALL readable alpha pages
+    readable = []
     for cap, typ, body, pc in pages:
         if alpha_only and typ not in ("ALN", "SPN"):   # keep only alpha pages
             continue
@@ -1083,6 +1106,8 @@ def main():
         t = tier_of(pc, pr, en)
         tiers[t] += 1
         by_tier_type[t][typ] = by_tier_type[t].get(typ, 0) + 1
+        if dump_readable and en >= ALPHA_EN_OK and pr >= 0.85:
+            readable.append(body.decode("ascii", "replace"))
         if t in ("A", "B") or len(samples) < 36:
             mg = pc["margin"] if pc else float("nan")
             samples.append((t, typ, mg, pr, en, body.decode("ascii", "replace")))
@@ -1090,7 +1115,7 @@ def main():
     fe = "mfbank" + ("" if nocfo else "+cfo") + ("+coh" if coh else "") + ("+inv" if inv else "") if mfbank else "fm-disc"
     acq = ("corr-grid" if corr_grid else "corr-peaks") if corr else "hardsync"
     fe = f"{fe}/{acq}"
-    ctxt = f" carrier={929.6125 + carrier/1e6:.4f}MHz (offset{carrier/1e3:+.0f}kHz)" if carrier else ""
+    ctxt = f" carrier={center_mhz + carrier/1e6:.4f}MHz (offset{carrier/1e3:+.0f}kHz)" if carrier else ""
     print(f"=== slicer={slicer} front-end={fe} soft={soft} comb={'--comb' in sys.argv}{ctxt} ===")
     print(f"frames        : {len(frames)} (anchors synced={n_anchor}, comb-synth={len(frames)-n_anchor})")
     print(f"BCH corrected : {bch_corr}   Chase-recovered: {bch_chase}   BCH FAILED: {bch_fail}")
@@ -1105,6 +1130,10 @@ def main():
         mtxt = f"{mg:4.2f}" if mg == mg else " nan"
         entxt = f" en={en:.2f}" if alpha_only else ""
         print(f"  [{t} m={mtxt} pr={pr:.2f}{entxt}] {typ}: {s!r}")
+    if dump_readable:
+        print("--- readable-dump ---")
+        for s in readable:
+            print(f"READABLE\t{s!r}")
 
 if __name__ == "__main__":
     main()

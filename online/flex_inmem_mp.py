@@ -194,9 +194,19 @@ def run_file(cfile, in_rate):
     return pages_val.value
 
 
+# Per-carrier queue depth. Every carrier runs the same overlapped-window DSP
+# (matched-filter bank + sync correlation) each window, regardless of content,
+# so the worker stops draining for the multi-second decode burst. Average
+# decode keeps up (<1 core), so the worker catches up between bursts -- the
+# queue just has to hold one window-decode's worth of input. At 64 it overflowed
+# during every burst (~30 drops/s/carrier); 1024 (~17 s @ 250 kS/s, ~64 MB/carrier
+# worst case) absorbs the burst with no recall risk (window stays at 32).
+QUEUE_MAXCHUNKS = 1024
+
+
 def run_live(fifo_dir):
     os.makedirs(LOG_DIR, exist_ok=True)
-    queues = {c: mp.Queue(maxsize=64) for c in CARRIERS}
+    queues = {c: mp.Queue(maxsize=QUEUE_MAXCHUNKS) for c in CARRIERS}
     pages = {c: mp.Value('i', 0) for c in CARRIERS}
 
     procs = {}

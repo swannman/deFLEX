@@ -224,8 +224,14 @@ benchmark result bit-for-bit).
 - **The two "0-frame" carriers are not flexdec failures:** 931.0625 is a POCSAG
   channel (flexdec doesn't do POCSAG); 929.5875 simply had no decodable FLEX
   traffic in the 4-minute window (a tighter LPF didn't recover it).
-- All active carriers are **mode 3** (3200 baud / 4-level), which flexdec
-  handles natively.
+- **Both FLEX speeds are live, and flexdec decodes both.** Confirmed from the
+  self-identifying sync codeword (independently corroborated by multimon's rate
+  tag), not inferred from output: 929.6125 / 929.6625 / 931.2125 are **3200 baud
+  4-level (6400 bps)**; 929.9375 / 931.9375 are **1600 baud 4-level (3200 bps)**.
+  flexdec picks the mode per frame via sync-template correlation (`corr_acquire`)
+  and demuxes 4-level symbols differently per baud (1600: A/B; 3200: A/B/C/D
+  interleaved), so clean BCH-validated English came off the half-rate carriers
+  too (the trauma alert on 929.9375, the shift-break notice on 931.9375).
 
 **Fair A/B vs channelized multimon** (same English gate on both sides, plus
 `difflib` fuzzy clustering at ratio ≥0.80 to collapse garbled near-duplicates):
@@ -239,6 +245,32 @@ deduplicated.
 tracks per-carrier SNR (2–131 trustworthy), but fidelity is uniformly excellent
 wherever signal exists — which is what matters for downstream
 machine-classification of bodies.
+
+### Would re-admitting `C_suspect` buy more recall? (probe, 2026-05-29)
+
+The open question after Phase 2 was whether the B-only default leaves real
+messages on the table in the `C_suspect` tier on weak carriers. Probed it
+directly: dumped **every** C-tier alpha page (no readability floor) on all 5
+active carriers, clustered (ratio ≥0.80), and compared against the admitted B
+set (method: dump every C page with its en/pr, fuzzy-cluster, subtract B).
+
+| carrier | C pages | new clusters vs B | genuinely readable new msgs |
+|---|---|---|---|
+| 929.6125 | 302 | 212 | 1 (a garbled-header NWS forecast) |
+| 929.6625 | 453 | 319 | 0 |
+| 929.9375 | 223 | 161 | 0 |
+| 931.2125 | 440 | 329 | 0 |
+| 931.9375 | 237 | 170 | 0 |
+
+Re-admitting C means accepting **~1,190 new clusters to recover ~1 readable
+message.** There *is* real signal buried in C on the weak carriers — fragments of
+a trauma alert and a shift-break notice were visible — but they arrive **below the
+trust floor** (en 0.5–0.59), indistinguishable from pure garble and encrypted
+base64 tokens at the same scores. No threshold pulls them in cleanly.
+
+**Conclusion:** keep the B-only default. The right lever for weak-carrier recall
+is better *acquisition* (more capture time / per-carrier gain) so those fragments
+arrive at B-tier quality — not relaxing the tier gate.
 
 ---
 

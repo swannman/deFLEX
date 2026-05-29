@@ -45,7 +45,8 @@ offline/            ← batch research / A-B tool  (see offline/README.md)
 
 online/             ← live real-time receiver    (see online/README.md)
   flexdec_stream.py   StreamDecoder: overlapped-batch replay + dedup
-  flex_inmem.py       production: SDR → freq-xlate → ring → worker → decoder
+  flex_inmem_mp.py    production: SDR -> freq-xlate -> ring -> per-carrier PROCESS -> decoder
+  flex_inmem.py       threaded variant (GIL-bound), superseded by flex_inmem_mp.py
   flex_stream_live.py standalone single-carrier .cfile tail (dev)
   flex-receiver-flexdec.service
   legacy/
@@ -71,10 +72,12 @@ online/             ← live real-time receiver    (see online/README.md)
 
 The live in-memory flexdec receiver **replaced multimon-ng in production on
 2026-05-29** (`flex-receiver.service` on p340): RSPdx @ 2.5 MS/s → 5 carriers →
-`StreamDecoder` threads → `/var/log/flex`, feeding the existing web viewer with
-no server change. See [`online/README.md`](online/README.md) for the full design
-and one **open limitation** (5 concurrent decoders don't yet fit the 3-core CPU
-budget — only the strongest carrier currently keeps up).
+one **`StreamDecoder` process per carrier** (`flex_inmem_mp.py`, multiprocessing
+to beat the GIL) → `/var/log/flex`, feeding the existing web viewer with no
+server change. See [`online/README.md`](online/README.md) for the full design and
+the remaining **open limitation** (per-carrier decode is single-threaded and the
+active carriers sit at ~1 core, so they accrue slow residual IQ drops — partial
+recall, not the threaded build's near-total starvation of the weak carriers).
 
 The decoder is **not** GPL `multimon-ng`-derived: it was built from the TIA-1500
 tables (using `gr-pager` only as a protocol reference, not linked).

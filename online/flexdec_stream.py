@@ -38,7 +38,7 @@ FRAME_250 = int(round(F.FRAME_PERIOD * F.SAMP / F.FS))
 # Mirror of the validated `--mfbank --corr --comb --sweep --soft --alpha` run.
 DEFAULT_CFG = dict(
     mfbank=True, nocfo=False, coh=False, coh_alpha=0.05, inv=False,
-    soft=True, slicer="perframe", sweep=True, frac=False,
+    soft=True, slicer="perframe", sweep=True, sweep_half=1, frac=False,
     alpha_only=True, comb=True, mflen=F.SPB, corr_off=1517.0,
     lpf=12000.0, in_rate=F.SAMP, MARGIN_OK=0.5, ALPHA_EN_OK=0.60,
 )
@@ -137,7 +137,18 @@ def decode_window(xb, s0, cfg):
         elif cfg["frac"]:
             offs = list(np.arange(-spb / 2, spb / 2, 0.5))
         else:
-            offs = [float(o) for o in range(-(spb // 2), spb - spb // 2)]
+            # Timing-phase search around the sync-locked grid. mf_bank_mag is
+            # ~68% of decode CPU and the sweep multiplies it by len(offs)*len(pars)
+            # per frame; sweep_half bounds the integer offset window. ±1 (3 offsets)
+            # vs the full ±spb//2: A/B on the frozen strong+weak captures dropped
+            # only one garbage SPN that had squeaked past the English gate and
+            # gained one real page on the weak carrier, while cutting mf_bank_mag
+            # calls ~36%. None=full width.
+            _h = cfg.get("sweep_half")
+            if _h is not None:
+                offs = [float(o) for o in range(-_h, _h + 1)]
+            else:
+                offs = [float(o) for o in range(-(spb // 2), spb - spb // 2)]
         pars = [0, 1] if f["baud"] == 3200 else [0]
         best = None
         for par in pars:

@@ -312,14 +312,68 @@ sample message bodies tagged `[tier margin printable% english]`.
 
 **This is an offline research tool, not the live decoder.** The production
 7-channel receiver (`flex-receiver.service` on p340) runs `multimon-ng` and is
-unaffected by anything here. flexdec is **batch** (reads a whole `.cfile`
-start-to-finish; no streaming path) and has only been validated on **one
-carrier / 120 s / mode-3 (3200 baud)**. Promoting it would require a streaming
-acquisition path and validation on the 6400-baud carriers.
+unaffected by anything here. The core `flexdec.py` is **batch** (reads a whole
+`.cfile` start-to-finish) and has been validated on **one carrier / 120 s**,
+covering **both live FLEX speeds** (3200 baud/4-level = 6400 bps and 1600
+baud/4-level = 3200 bps — see the dual-speed note above). A **streaming wrapper**
+(`flexdec_stream.py`, below) now reproduces the batch A/B output exactly, but it
+has not yet been wired to a live SDR tap.
 
 A realistic path is a **hybrid**: keep multimon as the live workhorse, run
 flexdec as a second-pass refiner on the weak/sparse carriers (929.6625) where it
 clearly wins, or as an offline re-decode of logged IQ.
+
+---
+
+## Streaming (`flexdec_stream.py`)
+
+A live decoder built **on top of** the frozen batch core — `flexdec.py` is
+imported unchanged (md5 verified), so the streaming path can never drift from
+the validated A/B baseline. The only added code is the *scaffolding*: a
+complex-baseband ring buffer, an overlapped-window scheduler, and per-frame-slot
+dedup. The actual symbol decode replays `flexdec.main()`'s per-frame loop
+verbatim (matched-filter bank + per-frame CFO null + Chase-II soft FEC + the
+`--alpha` English-likeness tier gate).
+
+**Why overlapped-batch + dedup, not a stateful streaming demod.** FLEX is
+strictly periodic (`FRAME_PERIOD = 30000` @ 16 kHz = 1.875 s) on a shared
+transmitter clock, so a frame is self-contained. Re-running the validated batch
+decode on a sliding window and de-duplicating by *absolute frame slot* is
+provably equivalent to batch — there is no resampler state to drift. The window
+overlaps by ≥ one frame so every frame is fully inside at least one window;
+dedup on `(slot, type, body)` collapses the repeats.
+
+- **Tap point:** the **complex baseband** after channel-select (post freq-xlate,
+  pre channel-LPF) — the same samples the matched-filter bank needs. Tapping the
+  real FM-discriminator output instead would forfeit the MF-bank quality win
+  (A+B = 34 vs 24 on the benchmark).
+- **Window / advance:** default **16 frames (30 s) / 8 frames (15 s)**.
+  `corr_frames`' `grid_phase` locks the frame grid from the sync anchors *in the
+  window*, so a window needs ~16 anchors for its grid to match the whole-capture
+  grid to sub-symbol precision. 8/4 dropped one marginal 3-char SPN page; 16/8
+  (and larger) reproduce the batch A/B set exactly.
+
+**Validation** (`python3 flexdec_stream.py [cfile]`): replays the frozen 250 k
+benchmark in 2 s chunks through `StreamDecoder.feed()` and asserts the streamed
+trustworthy-A/B set is a superset of a whole-file batch decode of the same data.
+Result on `iq_929612500_250k.cfile`: **batch 32, streamed 32, 0 missing, 0
+extra → PASS.** (The whole-file `decode_window` also reproduces `flexdec.py`'s
+raw A+B = 34 page-instance count, confirming the lifted loop is byte-faithful;
+32 is the deduped unique-message count.)
+
+Library use:
+
+```python
+import flexdec_stream as S
+sd = S.StreamDecoder(on_page=lambda r: print(r))   # r = (slot, type, body, tier, pr, en)
+for chunk in source_of_complex64_baseband_at_250k():
+    sd.feed(chunk)
+sd.flush()
+```
+
+Not yet done: the live SDR tap (feed the GNU Radio `conjugate_cc` output per
+carrier into `feed()` instead of replaying a file), and per-carrier resampling
+if the tap rate ≠ 250 k.
 
 ---
 

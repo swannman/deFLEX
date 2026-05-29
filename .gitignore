@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 *.cfile
 *.s16
+*.log
+*.out
+*.prof

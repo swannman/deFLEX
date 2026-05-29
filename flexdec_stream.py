@@ -36,7 +36,7 @@ DEFAULT_CFG = dict(
     mfbank=True, nocfo=False, coh=False, coh_alpha=0.05, inv=False,
     soft=True, slicer="perframe", sweep=True, frac=False,
     alpha_only=True, comb=True, mflen=F.SPB, corr_off=1517.0,
-    lpf=12000.0, MARGIN_OK=0.5, ALPHA_EN_OK=0.60,
+    lpf=12000.0, in_rate=F.SAMP, MARGIN_OK=0.5, ALPHA_EN_OK=0.60,
 )
 
 
@@ -67,12 +67,19 @@ def decode_window(xb, s0, cfg):
     Returns list of (slot, typ, body_bytes, pc). This is flexdec.main()'s frame
     loop (lines ~998-1055) lifted verbatim, parameterized by cfg/xb/demod.
 
-    `xb` is the channel-selected complex baseband at 250k (post freq-xlate, pre
-    LPF). We apply the same 127-tap channel LPF load_baseband() applies so the
+    `xb` is the channel-selected complex baseband (post freq-xlate). If its rate
+    `cfg["in_rate"]` differs from the internal SAMP (250k) -- e.g. a live tap at
+    22050 Hz -- we polyphase-resample the window to 250k first, exactly as
+    load_baseband() does, then apply the same 127-tap channel LPF, so the
     matched-filter bank and FM demod see identical samples to a batch run. The
-    filter is run per-window; its ~127-sample (0.5 ms) edge transient is far
-    shorter than a frame, and window overlap keeps every frame away from an edge
-    in at least one window."""
+    resample+filter run per-window; their edge transient is far shorter than a
+    frame, and window overlap keeps every frame away from an edge in at least one
+    window. `s0` is in INPUT-rate samples (mapped to the 16k grid for slots)."""
+    in_rate = cfg["in_rate"]
+    if in_rate != F.SAMP:
+        from math import gcd
+        g = gcd(int(round(in_rate)), F.SAMP)
+        xb = signal.resample_poly(xb, F.SAMP // g, int(round(in_rate)) // g)
     taps = signal.firwin(127, cfg["lpf"] / (F.SAMP / 2))
     xb = signal.lfilter(taps, 1.0, xb)
     demod = F.demod_from_baseband(xb, mf=False, mflen=cfg["mflen"])
@@ -153,7 +160,7 @@ def decode_window(xb, s0, cfg):
             bsyms = sample_at(bpos)
             wordsets, confsets, nf, nc, nch = decode_syms(
                 bsyms, f["baud"], f["levels"], chase=True)
-        abs16 = s0 * F.FS / F.SAMP + p0          # this frame's absolute 16k position
+        abs16 = s0 * F.FS / cfg["in_rate"] + p0  # this frame's absolute 16k position
         slot = int(round(abs16 / F.FRAME_PERIOD))
         for words, cf in zip(wordsets, confsets):
             if words is not None:
@@ -163,9 +170,9 @@ def decode_window(xb, s0, cfg):
 
 
 class StreamDecoder:
-    """Feed complex baseband (already channelized to one carrier @ 250k) in
-    arbitrary-sized chunks; emits trustworthy A/B alpha pages exactly once each.
-    Use `on_page` callback or read `self.pages` after `flush()`."""
+    """Feed complex baseband (already channelized to one carrier at cfg['in_rate'],
+    default 250k) in arbitrary-sized chunks; emits trustworthy A/B alpha pages
+    exactly once each. Use `on_page` callback or read `self.pages` after `flush()`."""
 
     def __init__(self, cfg=None, window_frames=16, advance_frames=8, on_page=None):
         # 16-frame (30 s) window / 8-frame (15 s) advance: corr_frames' grid_phase
@@ -175,11 +182,13 @@ class StreamDecoder:
         # under the tier-B margin. 8/4 lost one marginal 3-char SPN; 16/8 (and
         # larger) reproduce the batch A/B set exactly.
         self.cfg = dict(DEFAULT_CFG, **(cfg or {}))
-        self.window = window_frames * FRAME_250
-        self.advance = advance_frames * FRAME_250
+        # window/advance counted in INPUT-rate samples (one frame period at in_rate)
+        self.frame_samp = int(round(F.FRAME_PERIOD * self.cfg["in_rate"] / F.FS))
+        self.window = window_frames * self.frame_samp
+        self.advance = advance_frames * self.frame_samp
         self.on_page = on_page
         self.buf = np.empty(0, dtype=np.complex64)
-        self.base = 0                 # absolute 250k index of buf[0]
+        self.base = 0                 # absolute input-rate index of buf[0]
         self.seen = set()             # (slot, typ, body) already emitted
         self.pages = []               # accepted A/B pages (slot, typ, body, tier, pr, en)
 
@@ -206,7 +215,7 @@ class StreamDecoder:
         # for overlap). Non-final: only fire on full windows, leaving the overlap
         # tail buffered for the next feed. Final: also process the short tail
         # (needs >= ~1.5 frames to possibly contain a decodable frame).
-        min_final = int(1.5 * FRAME_250)
+        min_final = int(1.5 * self.frame_samp)
         while True:
             have = len(self.buf)
             if not final:

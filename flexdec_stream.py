@@ -20,12 +20,12 @@ Why "overlapped batch + dedup" instead of a stateful streaming demod:
 Validation target: replay iq_929612500_250k.cfile (already complex @ 250k, no
 resampling) in chunks; the streamed A/B set must be a superset of the batch set.
 """
+import os
 import sys
 import numpy as np
 from scipy import signal
 
-sys.path.insert(0, "/tmp/flex_ab")
-sys.path.insert(0, "/tmp/pager-bindings")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import flexdec as F
 
 # 250k samples per FLEX frame period (468750) -- the streaming quantum.

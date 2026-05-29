@@ -31,15 +31,14 @@ import numpy as np
 from gnuradio import gr, blocks, filter, soapy
 from gnuradio.filter import firdes
 
-sys.path.insert(0, "/tmp/flex_ab")
-sys.path.insert(0, "/tmp/pager-bindings")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import flexdec_stream as S
 import flexdec as F
 
 CENTER     = 930_762_500
-SAMP_RATE  = 2_646_000
+SAMP_RATE  = 2_500_000                    # /10 -> 250000 == flexdec.SAMP: no resample_poly
 DECIM      = 10
-IN_RATE    = SAMP_RATE // DECIM          # 264600 Hz complex baseband
+IN_RATE    = SAMP_RATE // DECIM          # 250000 Hz complex baseband (== F.SAMP)
 WINDOW_FR  = 32                          # see flexdec_stream: >=16 reproduces batch
 ADVANCE_FR = 28                          # 4-frame edge margin, ~0.54x realtime/carrier
 
@@ -203,10 +202,20 @@ def run_live(fifo_dir):
 
         def on_page(rec):
             slot, typ, body, tier, pr, en = rec
+            # ALN only -- SPN decodes to garbage on these carriers (control chars,
+            # no words), so it is dropped here and never written or fed to the viewer.
+            if typ != "ALN":
+                return
             ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            line = "%s FLEX|%d|%d|%s|pr=%.2f|en=%.2f|%s" % (
-                ts, carrier, slot, typ, pr, en,
-                body.decode("ascii", "replace"))
+            # Legacy multimon "FLEX|" line shape so flex_tail_server parses it with
+            # NO server change: FLEX|<f1>|<f2>|<f3>|<capcode>|ALN|<body>, body = p[6:],
+            # flag always K. capcode is fixed at 0 so the viewer's (capcode, body)
+            # dedup collapses to body-only -> kills retransmits + same page on two
+            # carriers. Escape CR/LF/TAB to literal so one page stays one log line.
+            text = (body.decode("ascii", "replace")
+                    .replace("\\", "\\\\").replace("\n", "\\n")
+                    .replace("\r", "\\r").replace("\t", "\\t"))
+            line = "%s FLEX|%d|%d|%s|0|ALN|%s" % (ts, carrier, slot, tier, text)
             lf.write(line + "\n")
         return on_page
 
@@ -219,7 +228,9 @@ def run_live(fifo_dir):
 
     print(f"flex_inmem LIVE: RSPdx @ {CENTER/1e6:.4f} MHz, {SAMP_RATE} S/s -> "
           f"{len(CARRIERS)} carriers @ {IN_RATE} Hz -> StreamDecoder threads "
-          f"(window={WINDOW_FR} advance={ADVANCE_FR})", file=sys.stderr, flush=True)
+          f"(window={WINDOW_FR} advance={ADVANCE_FR}) numba={F._HAVE_NUMBA} "
+          f"resample={'OFF' if IN_RATE == F.SAMP else 'ON'}",
+          file=sys.stderr, flush=True)
     tb.start()
     try:
         while True:

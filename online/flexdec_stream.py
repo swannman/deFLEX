@@ -21,6 +21,7 @@ Validation target: replay iq_929612500_250k.cfile (already complex @ 250k, no
 resampling) in chunks; the streamed A/B set must be a superset of the batch set.
 """
 import os
+import re
 import sys
 import numpy as np
 from scipy import signal
@@ -34,6 +35,20 @@ import flexdec as F
 
 # 250k samples per FLEX frame period (468750) -- the streaming quantum.
 FRAME_250 = int(round(F.FRAME_PERIOD * F.SAMP / F.FS))
+
+# Dedup-key normalization. Overlapping windows re-decode the same frame slot;
+# the low-reliability tail of a short/empty message gets Chase-corrected into
+# slightly different junk each pass -- varying whitespace and a stray trailing
+# "[nn]" -- so an exact (slot,typ,body) key emits the same logical page several
+# times. Collapse whitespace and strip trailing "[nn]" tokens for the KEY ONLY;
+# the full original body is still logged. A/B on the frozen strong+weak captures:
+# every collapse was a genuine same-message duplicate (e.g. an "HMC Rapid
+# Response" page recurring with [], [84], [94]); no distinct real page merged.
+_WS_RUN = re.compile(rb"\s+")
+_TRAIL_BRACKET = re.compile(rb"(\s*\[\d+\])+\s*$")
+
+def dedup_body(body):
+    return _TRAIL_BRACKET.sub(b"", _WS_RUN.sub(b" ", body).strip()).strip()
 
 # Mirror of the validated `--mfbank --corr --comb --sweep --soft --alpha` run.
 DEFAULT_CFG = dict(
@@ -204,7 +219,7 @@ class StreamDecoder:
         self.on_page = on_page
         self.buf = np.empty(0, dtype=np.complex64)
         self.base = 0                 # absolute input-rate index of buf[0]
-        self.seen = set()             # (slot, typ, body) already emitted
+        self.seen = set()             # (slot, typ, dedup_body(body)) already emitted
         self.pages = []               # accepted A/B pages (slot, typ, body, tier, pr, en)
 
     def _emit(self, results):
@@ -216,7 +231,7 @@ class StreamDecoder:
             t, pr, en = _classify(typ, body, pc, self.cfg)
             if t not in ("A", "B"):
                 continue
-            key = (slot, typ, body)
+            key = (slot, typ, dedup_body(body))
             if key in self.seen:
                 continue
             self.seen.add(key)

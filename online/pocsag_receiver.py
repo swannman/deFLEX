@@ -86,7 +86,7 @@ def run_file(cfile, in_rate, log_path=None):
 # --- live path (RTL-SDR via SoapySDR + GNU Radio) ---------------------------
 # Imported lazily so file mode runs on a box without GNU Radio installed.
 
-def run_live(log_dir):
+def run_live(log_dir, driver="rtlsdr"):
     import queue
     import threading
     from gnuradio import gr, blocks, soapy
@@ -148,17 +148,17 @@ def run_live(log_dir):
     class LiveGraph(gr.top_block):
         def __init__(self):
             gr.top_block.__init__(self, "pocsag_receiver_live")
-            self.src = soapy.source("driver=rtlsdr", "fc32", 1, "", "", [""], [""])
-            self.src.set_sample_rate(0, RX_RATE)
+            self.src = soapy.source(f"driver={driver}", "fc32", 1, "", "", [""], [""])
+            self.src.set_sample_rate(0, RX_RATE)   # 250k: native on RTL & RSPdx
             self.src.set_frequency(0, FREQ)
-            self.src.set_gain_mode(0, True)        # RTL AGC; signal is strong
+            self.src.set_gain_mode(0, True)        # AGC; signal is strong
             self.sink = PocsagSink()
             self.connect(self.src, self.sink)
 
     t = threading.Thread(target=worker, daemon=True)
     t.start()
     tb = LiveGraph()
-    print(f"pocsag_receiver LIVE: RTL-SDR @ {FREQ/1e6:.4f} MHz, {RX_RATE} S/s -> "
+    print(f"pocsag_receiver LIVE: {driver} @ {FREQ/1e6:.4f} MHz, {RX_RATE} S/s -> "
           f"POCSAGStream -> {log_path}", file=sys.stderr, flush=True)
     tb.start()
     try:
@@ -177,12 +177,15 @@ def main():
     ap.add_argument("--file")
     ap.add_argument("--in-rate", type=float, default=float(RX_RATE))
     ap.add_argument("--live", action="store_true")
+    ap.add_argument("--driver", default="rtlsdr",
+                    help="SoapySDR driver for --live (rtlsdr|sdrplay). "
+                         "Use sdrplay to time-share the FLEX RSPdx.")
     ap.add_argument("--log", help="log dir (live) or file (file mode); default stdout")
     args = ap.parse_args()
     if args.file:
         run_file(args.file, args.in_rate, log_path=args.log)
     elif args.live:
-        run_live(args.log or LOG_DIR)
+        run_live(args.log or LOG_DIR, driver=args.driver)
     else:
         ap.error("specify --file CFILE or --live")
 

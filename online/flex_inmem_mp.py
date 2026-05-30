@@ -140,9 +140,9 @@ class FileGraph(gr.top_block):
 class LiveGraph(gr.top_block):
     """SoapySDR RSPdx -> per-carrier freq_xlate -> RingSink (one mp.Queue each)."""
 
-    def __init__(self, queues):
+    def __init__(self, queues, driver="sdrplay"):
         gr.top_block.__init__(self, "flex_inmem_mp_live")
-        self.src = soapy.source("driver=sdrplay", "fc32", 1, "", "", [""], [""])
+        self.src = soapy.source(f"driver={driver}", "fc32", 1, "", "", [""], [""])
         self.src.set_sample_rate(0, SAMP_RATE)
         self.src.set_frequency(0, CENTER)
         self.src.set_gain_mode(0, False)
@@ -204,7 +204,7 @@ def run_file(cfile, in_rate):
 QUEUE_MAXCHUNKS = 1024
 
 
-def run_live(fifo_dir):
+def run_live(fifo_dir, driver="sdrplay"):
     os.makedirs(LOG_DIR, exist_ok=True)
     queues = {c: mp.Queue(maxsize=QUEUE_MAXCHUNKS) for c in CARRIERS}
     pages = {c: mp.Value('i', 0) for c in CARRIERS}
@@ -219,8 +219,8 @@ def run_live(fifo_dir):
         p.start()
         procs[carrier] = p
 
-    tb = LiveGraph(queues)
-    print(f"flex_inmem_mp LIVE: RSPdx @ {CENTER/1e6:.4f} MHz, {SAMP_RATE} S/s -> "
+    tb = LiveGraph(queues, driver=driver)
+    print(f"flex_inmem_mp LIVE: {driver} @ {CENTER/1e6:.4f} MHz, {SAMP_RATE} S/s -> "
           f"{len(CARRIERS)} carriers @ {IN_RATE} Hz -> StreamDecoder PROCESSES "
           f"(window={WINDOW_FR} advance={ADVANCE_FR}) numba={F._HAVE_NUMBA} "
           f"resample={'OFF' if IN_RATE == F.SAMP else 'ON'}",
@@ -245,12 +245,14 @@ def main():
     ap.add_argument("--file")
     ap.add_argument("--in-rate", type=float, default=float(F.SAMP))
     ap.add_argument("--live", action="store_true")
+    ap.add_argument("--driver", default="sdrplay",
+                    help="SoapySDR driver for --live (sdrplay|rtlsdr|airspy)")
     ap.add_argument("fifo_dir", nargs="?", default="/tmp/flex")
     args = ap.parse_args()
     if args.file:
         run_file(args.file, args.in_rate)
     elif args.live:
-        run_live(args.fifo_dir)
+        run_live(args.fifo_dir, driver=args.driver)
     else:
         ap.error("specify --file CFILE or --live")
 

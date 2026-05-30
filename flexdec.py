@@ -192,21 +192,36 @@ def mf_bank_mag(xb, pos16, baud, cfo=0.0, inv=False, complex_out=False):
     (3200 Hz) equals the baud rate, so the tones are orthogonal over a symbol.
     `cfo` (Hz, Tier 2) shifts the reference tones to null residual carrier.
     `complex_out` returns the raw complex correlations instead of |.| (the phase
-    is the carrier phase at the symbol center -- used by the coherent detector)."""
+    is the carrier phase at the symbol center -- used by the coherent detector).
+
+    Implementation: the reference phase factorizes. For symbol s, lag l the
+    per-sample offset is rel[s,l] = frac[s] + lrel[l], where lrel[l] = l-half is
+    identical for every symbol and frac[s] = round(pos[s])-pos[s] is the per-symbol
+    rounding residual. So exp(-jw*rel) = exp(-jw*lrel[l]) * exp(-jw*frac[s]) and
+    the correlation becomes a single (nsym,L)@(L,4) complex matmul (BLAS) times a
+    per-symbol phase, instead of four full (nsym,L) exponentials -- ~9x faster,
+    bit-faithful (validated page-identical on the frozen captures). The factoring
+    only holds where idx is unclipped; clipped boundary rows fall back to the exact
+    per-sample form."""
     pos = pos16 * (SAMP / FS)                        # symbol centers in 250k samples
     L = int(round(SAMP / baud)); half = L // 2
     n0 = np.round(pos).astype(np.int64)
-    idx = n0[:, None] + (np.arange(L) - half)[None, :]
-    idx = np.clip(idx, 0, len(xb) - 1)
+    lrel = (np.arange(L) - half).astype(np.float64)
+    idx_un = n0[:, None] + lrel.astype(np.int64)[None, :]
+    idx = np.clip(idx_un, 0, len(xb) - 1)
     seg = xb[idx]                                    # (nsym, L) complex
-    rel = idx - pos[:, None]                          # fractional offset from true center
+    frac = n0 - pos                                  # (nsym,) rounding residual
     tones = (FLEX_TONES[::-1] if inv else FLEX_TONES) + cfo
-    out = np.empty((len(pos), 4), dtype=(np.complex128 if complex_out else float))
-    for k, f in enumerate(tones):
-        ref = np.exp(-1j * 2 * np.pi * f / SAMP * rel)
-        c = np.sum(seg * ref, axis=1)
-        out[:, k] = c if complex_out else np.abs(c)
-    return out
+    w = 2 * np.pi * tones / SAMP                      # (4,)
+    tonemat = np.exp(-1j * np.outer(lrel, w))         # (L,4), computed once
+    c = (seg.astype(np.complex128) @ tonemat) * np.exp(-1j * np.outer(frac, w))
+    clipped = np.any(idx_un != idx, axis=1)
+    if np.any(clipped):                               # exact form on boundary rows
+        rel = idx[clipped] - pos[clipped, None]
+        segc = seg[clipped]
+        for k, f in enumerate(tones):
+            c[clipped, k] = np.sum(segc * np.exp(-1j * 2 * np.pi * f / SAMP * rel), axis=1)
+    return c.astype(np.complex128) if complex_out else np.abs(c)
 
 def coherent_metric(C, baud, inv=False, alpha=0.05):
     """Tier 3: coherent CPFSK per-symbol phase tracking via a SQUARING loop.

@@ -218,6 +218,8 @@ class StreamDecoder:
         self.advance = advance_frames * self.frame_samp
         self.on_page = on_page
         self.buf = np.empty(0, dtype=np.complex64)
+        self._pending = []            # chunks fed but not yet merged into buf
+        self._pending_len = 0
         self.base = 0                 # absolute input-rate index of buf[0]
         self.seen = set()             # (slot, typ, dedup_body(body)) already emitted
         self.pages = []               # accepted A/B pages (slot, typ, body, tier, pr, en)
@@ -266,12 +268,31 @@ class StreamDecoder:
                 self.buf = self.buf[self.advance:]
                 self.base += self.advance
 
+    def _merge_pending(self):
+        # Concatenate the buffer ONCE per window-fill instead of once per feed.
+        # buf can hold a full 32-frame window (~15M complex64 ≈ 120 MB); the old
+        # per-feed np.concatenate([buf, chunk]) recopied all of it for every small
+        # SDR chunk (~120 MB memcpy ×30/s at 8k-sample chunks), which dominated
+        # live CPU (py-spy: 99% in feed) and scaled inversely with chunk size.
+        if not self._pending:
+            return
+        parts = ([self.buf] if len(self.buf) else []) + self._pending
+        self.buf = parts[0] if len(parts) == 1 else np.concatenate(parts)
+        self._pending = []
+        self._pending_len = 0
+
     def feed(self, samples):
         s = np.asarray(samples, dtype=np.complex64)
-        self.buf = np.concatenate([self.buf, s]) if len(self.buf) else s
-        self._drain(final=False)
+        self._pending.append(s)
+        self._pending_len += len(s)
+        # Only merge+drain once enough is buffered to form at least one window;
+        # _drain processes only full windows, so batching can't drop a window.
+        if len(self.buf) + self._pending_len >= self.window:
+            self._merge_pending()
+            self._drain(final=False)
 
     def flush(self):
+        self._merge_pending()
         self._drain(final=True)
         return self.pages
 

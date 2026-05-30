@@ -34,31 +34,40 @@ can't be, so they're dropped.
 
 ## Repository layout
 
-Two approaches, deliberately kept separate, over one shared decode core:
+Two protocols (FLEX + POCSAG), each with a batch decoder and a matching
+streaming wrapper, over one protocol-neutral core. The naming convention:
+**`<proto>dec.py` = batch, `online/<proto>dec_stream.py` = streaming.**
 
 ```
-flexdec.py          ← shared core: the validated batch FLEX decoder
-flexdec_numba.py    ← shared core: @njit kernels (GIL-releasing) for the hot loop
+paging_core.py      ← shared, protocol-NEUTRAL core: BCH(31,21) + Chase + english_score
+flexdec.py          ← FLEX batch decoder (imports paging_core)
+flexdec_numba.py    ← FLEX-only @njit kernels (GIL-releasing) for the deinterleave hot loop
+pocsagdec.py        ← POCSAG batch decoder (imports paging_core)
 
 offline/            ← batch research / A-B tool  (see offline/README.md)
   compare_ab.py       fair flexdec-vs-multimon comparison harness
 
-online/             ← live real-time receiver    (see online/README.md)
-  flexdec_stream.py   StreamDecoder: overlapped-batch replay + dedup
-  flex_inmem_mp.py    production: SDR -> freq-xlate -> ring -> per-carrier PROCESS -> decoder
-  flex_inmem.py       threaded variant (GIL-bound), superseded by flex_inmem_mp.py
-  flex_stream_live.py standalone single-carrier .cfile tail (dev)
+online/             ← live real-time receivers   (see online/README.md)
+  flexdec_stream.py     FLEX StreamDecoder: overlapped-batch replay + dedup
+  pocsagdec_stream.py   POCSAG POCSAGStream: overlapped-batch replay (emit-region)
+  flex_inmem_mp.py      production: SDR -> freq-xlate -> ring -> per-carrier PROCESS -> decoder
+  flex_inmem.py         threaded variant (GIL-bound), superseded by flex_inmem_mp.py
+  flex_stream_live.py   standalone single-carrier .cfile tail (dev)
+  pocsag_receiver.py    live POCSAG receiver (152.0075 SNO911 dispatch)
   flex-receiver-flexdec.service
   legacy/
     flex_7ch.py       retired multimon-ng flowgraph (kept for A/B provenance)
 ```
 
-- **`flexdec.py` / `flexdec_numba.py` (root)** — the shared core, imported
-  unchanged by both sides. `flexdec.py` was frozen as the known-good baseline,
-  then unfrozen 2026-05-29 to add numba acceleration; the njit path is **bit-exact**
-  vs pure Python (validated IDENTICAL A/B set, 32 pages) and its real win is
-  releasing the GIL so per-carrier threads parallelize. Pure-Python fallback
-  behind a `_HAVE_NUMBA` guard.
+- **`paging_core.py` (root)** — the protocol-NEUTRAL shared core: the BCH(31,21)
+  FEC + Chase soft-decoder and the `english_score` readability gate, imported by
+  both the FLEX and POCSAG decoders. Pure numpy/Python, no numba.
+- **`flexdec.py` / `flexdec_numba.py` (root)** — the FLEX batch decoder and its
+  FLEX-only njit deinterleave accelerator. `flexdec.py` was frozen as the
+  known-good baseline, then unfrozen 2026-05-29 to add numba acceleration; the
+  njit path is **bit-exact** vs pure Python (validated IDENTICAL A/B set, 32
+  pages) and its real win is releasing the GIL so per-carrier threads
+  parallelize. Pure-Python fallback behind a `_HAVE_NUMBA` guard.
 - **[`offline/`](offline/README.md)** — run `flexdec.py` over a frozen `.cfile`:
   the algorithm narrative, confidence tiering, the `--alpha` English gate, the
   full A/B-vs-multimon results, and the Phase 2 wideband (all-7-carrier) study.

@@ -5,10 +5,12 @@ at the repo root) run as a **batch research / A-B tool** over a frozen `.cfile`
 IQ capture. This is where the algorithm was designed, validated against
 `multimon-ng`, and frozen as the known-good baseline the live receiver builds on.
 
-> The shared decode core lives at the repo root (`flexdec.py`,
-> `flexdec_numba.py`) because both the offline and online paths import it
-> unchanged. This directory holds the offline-only workflow: batch invocation
-> and the A/B comparison harness (`compare_ab.py`).
+> The FLEX batch decoder lives at the repo root (`flexdec.py`, with its
+> FLEX-only njit kernels in `flexdec_numba.py`); the protocol-neutral shared
+> core it sits on (BCH + Chase + `english_score`) is `paging_core.py`. Both the
+> offline and online paths import these unchanged. This directory holds the
+> offline-only workflow: batch invocation and the A/B comparison harness
+> (`compare_ab.py`).
 
 The headline result: on a frozen 120 s benchmark capture, flexdec produces
 **FEC-validated, garbage-free** alpha decodes that are cleaner than multimon's,
@@ -324,7 +326,7 @@ Per-carrier unique-readable-alpha A/B of flexdec vs multimon-ng. Reads
 lowercase, keep alnum+space), applies the **same** `english_score` gate
 (≥0.60, ≥85% printable) to both sides, and reports unique counts plus
 `difflib` fuzzy overlap (ratio ≥0.80) so garbled near-duplicates cluster
-together. It imports `english_score` from the root `flexdec.py`, so the two
+together. It imports `english_score` from the root `paging_core.py`, so the two
 tools are judged by an identical readability gate.
 
 ---

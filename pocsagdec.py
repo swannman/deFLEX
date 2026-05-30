@@ -46,7 +46,7 @@ processing on arrays of numbers" -- there is no analog magic hiding in here.
    Mueller&Muller recovery -- there is no M&M loop; the brute phase search
    replaced it.)
 
-5. ERROR CORRECTION (`_decode_word` -> flexdec BCH + Chase).
+5. ERROR CORRECTION (`_decode_word` -> paging_core BCH + Chase).
    The air is noisy, so POCSAG wraps every 32-bit codeword in a BCH(31,21)
    error-correcting code (+1 parity bit) able to FIX up to 2 flipped bits per
    word with no retransmission. Words that still fail get a second pass with
@@ -60,14 +60,15 @@ processing on arrays of numbers" -- there is no analog magic hiding in here.
    never reaches the log.
 
 =============================================================================
-WHY THIS FILE CAN REUSE flexdec
+WHY THIS FILE SHARES paging_core
 =============================================================================
 POCSAG and FLEX share the *identical* BCH(31,21) codeword (generator 0x769).
 The POCSAG frame-sync codeword 0x7CD215D8 and idle codeword 0x7A89C197 both
-verify with zero syndrome under flexdec.bch3121, and flexdec.bch3121_chase
+verify with zero syndrome under paging_core.bch3121, and paging_core.bch3121_chase
 soft-decodes POCSAG words unchanged. english_score is reused for the
-alpha-readability gate. That hard-won FEC + language code lives in one place;
-this file only adds the POCSAG-specific framing on top.
+alpha-readability gate. That hard-won FEC + language code lives in one
+protocol-neutral place (paging_core.py, imported here as PC); this file only
+adds the POCSAG-specific framing on top.
 
 =============================================================================
 THE WIRE FORMAT (2-FSK NRZ)
@@ -97,7 +98,7 @@ import sys
 import numpy as np
 from scipy import signal
 
-import flexdec as F   # bch3121, bch3121_chase, english_score
+import paging_core as PC   # bch3121, bch3121_chase, english_score
 
 # ---------------------------------------------------------------------------
 # PROTOCOL CONSTANTS
@@ -107,7 +108,7 @@ import flexdec as F   # bch3121, bch3121_chase, english_score
 # the bit stream tells us both WHERE codewords begin and that our sampling/
 # polarity choices are correct. IDLE is the filler word sent in unused slots --
 # spotting it lets us close out a finished message. Both happen to be valid
-# BCH(31,21) codewords (zero syndrome), which is how flexdec's BCH validates them.
+# BCH(31,21) codewords (zero syndrome), which is how paging_core's BCH validates them.
 FSC  = 0x7CD215D8     # frame sync codeword
 IDLE = 0x7A89C197     # idle codeword
 FSC_INV = FSC ^ 0xFFFFFFFF   # FSC with every bit flipped (the opposite polarity)
@@ -142,7 +143,7 @@ def is_clean_alpha(text, en_floor=EN_FLOOR_DEFAULT):
         return False
     if any((c < 32 and c not in (9, 10, 13)) or c == 127 for c in text):
         return False
-    return F.english_score(text) >= en_floor
+    return PC.english_score(text) >= en_floor
 
 
 # ---------------------------------------------------------------------------
@@ -227,12 +228,12 @@ def _decode_word(w, mag32, chase=True):
     reliabilities (mag32), fall back to CHASE soft-decision decoding, which is
     allowed to fix more errors by trusting that the lowest-confidence bits are
     the likely culprits. `ok` is False only if both give up -- a genuinely
-    corrupted word we must drop. (Both routines are flexdec's, reused verbatim.)"""
-    cw, nerr = F.bch3121(w)
+    corrupted word we must drop. (Both routines are paging_core's, shared with FLEX.)"""
+    cw, nerr = PC.bch3121(w)
     if nerr >= 0:
         return cw, True
     if chase and mag32 is not None:
-        cw, metric = F.bch3121_chase(w, mag32, L=4)
+        cw, metric = PC.bch3121_chase(w, mag32, L=4)
         if metric >= 0:
             return cw, True
     return w, False
@@ -422,137 +423,12 @@ def decode_baseband(x, in_rate=IN_RATE_DEFAULT, on_page=None):
 
 
 # ---------------------------------------------------------------------------
-# STREAMING WRAPPER (for the live receiver)
+# STREAMING WRAPPER
 # ---------------------------------------------------------------------------
-# Offline we decode a whole file at once. Live, samples arrive forever in small
-# chunks and we must emit each page EXACTLY ONCE the moment we have enough of it.
-# The classic hazard: if we just decoded back-to-back fixed blocks, a page that
-# straddled a block boundary would be cut in half and lost. The fix is the
-# "overlap-save" pattern, borrowed from block convolution:
-#   * keep a sliding WINDOW of samples and decode it whole;
-#   * after each decode, advance by less than a window (ADVANCE < WINDOW), so
-#     consecutive windows OVERLAP by (window - advance) seconds;
-#   * only EMIT pages whose address codeword began within the first `advance`
-#     seconds of the window. A page emitted there still has the full overlap
-#     region after it to hold its (bounded-length) message, so it is never
-#     truncated; and because every page is emitted by exactly one window's
-#     emit-region, we get each page once with no de-dup bookkeeping.
-# The overlap just needs to exceed the longest possible transmission. This is
-# the POCSAG analogue of flexdec_stream.StreamDecoder.
-
-class POCSAGStream:
-    """Feed complex baseband (one carrier @ in_rate, default 250k) in arbitrary
-    chunks; emits alpha pages once each via on_page(addr, func, text) or read
-    self.pages after flush(). Sibling of flexdec_stream.StreamDecoder.
-
-    Unlike FLEX (frame-periodic on a shared clock) POCSAG has no global slot, so
-    we slide an overlapped window over the buffer and re-run the validated batch
-    decode per window. Exactly-once emission comes from overlap-save: a window
-    only emits pages whose address codeword starts within its first `advance`
-    symbols, so every emitted page has the full (window - advance) overlap left
-    to contain its message. With overlap >= the longest transmission, no page is
-    truncated at an edge and none lands in two windows' emit regions -- so no
-    de-dup is needed. The final flush emits its whole tail."""
-
-    def __init__(self, in_rate=IN_RATE_DEFAULT, window_s=30.0, advance_s=25.0,
-                 on_page=None):
-        self.in_rate = in_rate
-        self.window = int(window_s * in_rate)
-        self.advance = int(advance_s * in_rate)
-        self.advance_syms = int(advance_s * BAUD)   # emit cutoff (symbol units)
-        self.on_page = on_page
-        self.buf = np.empty(0, dtype=np.complex64)
-        self._pending = []
-        self._pending_len = 0
-        self.base = 0                  # absolute input-sample index of buf[0]
-        self.pages = []                # (addr, func, text)
-
-    def _emit(self, win_pages, emit_all):
-        for addr, func, text, pos in win_pages:
-            if not emit_all and pos >= self.advance_syms:
-                continue               # overlap region: the next window emits it
-            rec = (addr, func, text)
-            self.pages.append(rec)
-            if self.on_page:
-                self.on_page(rec)
-
-    def _merge_pending(self):
-        if not self._pending:
-            return
-        parts = ([self.buf] if len(self.buf) else []) + self._pending
-        self.buf = parts[0] if len(parts) == 1 else np.concatenate(parts)
-        self._pending = []
-        self._pending_len = 0
-
-    def _drain(self, final=False):
-        while True:
-            have = len(self.buf)
-            if not final:
-                if have < self.window:
-                    return
-                self._emit(decode_baseband(self.buf[:self.window], self.in_rate),
-                           emit_all=False)
-                self.buf = self.buf[self.advance:]
-                self.base += self.advance
-            else:
-                if have <= self.window:    # tail fits one window -> emit all of it
-                    if have:
-                        self._emit(decode_baseband(self.buf, self.in_rate),
-                                   emit_all=True)
-                    self.buf = self.buf[have:]
-                    self.base += have
-                    return
-                self._emit(decode_baseband(self.buf[:self.window], self.in_rate),
-                           emit_all=False)
-                self.buf = self.buf[self.advance:]
-                self.base += self.advance
-
-    def feed(self, samples):
-        s = np.asarray(samples, dtype=np.complex64)
-        self._pending.append(s)
-        self._pending_len += len(s)
-        if len(self.buf) + self._pending_len >= self.window:
-            self._merge_pending()
-            self._drain(final=False)
-
-    def flush(self):
-        self._merge_pending()
-        self._drain(final=True)
-        return self.pages
-
-
-def _validate_stream(cfile, in_rate=IN_RATE_DEFAULT, chunk_s=2.0,
-                     en_floor=EN_FLOOR_DEFAULT):
-    """Batch (whole-file) vs streamed (chunked) on the same data. Compares only
-    pages that pass is_clean_alpha -- the SAME gate the live receiver logs
-    behind. The batch picks one global sampling phase over the whole file while
-    the stream picks the best phase per window, so sub-readable garbage gets
-    different FEC bit-errors in each; the gate screens that out so what remains
-    is real pages, and the streamed set must cover the batch set."""
-    def readable(pages):
-        return {p[2] for p in pages if is_clean_alpha(p[2], en_floor)}
-
-    x = np.fromfile(cfile, dtype=np.complex64)
-    print(f"loaded {len(x)} samples ({len(x)/in_rate:.1f}s @ {in_rate/1e3:.0f}k)")
-    batch = readable(decode_baseband(x, in_rate))
-    print(f"batch readable pages: {len(batch)}")
-    ps = POCSAGStream(in_rate=in_rate)
-    chunk = int(chunk_s * in_rate)
-    for i in range(0, len(x), chunk):
-        ps.feed(x[i:i + chunk])
-    ps.flush()
-    stream = readable([(a, f, t) for a, f, t in ps.pages])
-    print(f"stream readable pages: {len(stream)}")
-    missing = batch - stream
-    extra = stream - batch
-    print(f"overlap={len(batch & stream)} missing={len(missing)} extra={len(extra)}")
-    for t in sorted(missing):
-        print(f"  MISSING {t.decode('ascii','replace')!r}")
-    for t in sorted(extra):
-        print(f"  EXTRA   {t.decode('ascii','replace')!r}")
-    ok = not missing
-    print(f"RESULT: {'PASS' if ok else 'FAIL'}")
-    return ok
+# The live-receiver streaming wrapper (POCSAGStream, overlap-save) lives in
+# online/pocsagdec_stream.py -- the POCSAG analogue of online/flexdec_stream.py.
+# It imports this module for the batch decode. Run that file directly to A/B the
+# streamed decode against this batch decode.
 
 
 def _main():
@@ -562,16 +438,12 @@ def _main():
     ap.add_argument("--in-rate", type=float, default=IN_RATE_DEFAULT)
     ap.add_argument("--min-en", type=float, default=0.0,
                     help="english_score floor to print a page (0 = print all)")
-    ap.add_argument("--validate-stream", action="store_true",
-                    help="A/B the streaming wrapper against the batch decode")
     args = ap.parse_args()
-    if args.validate_stream:
-        sys.exit(0 if _validate_stream(args.cfile, in_rate=args.in_rate) else 1)
     x = np.fromfile(args.cfile, dtype=np.complex64)
     pages = decode_baseband(x, in_rate=args.in_rate)
     shown = 0
     for addr, func, text, _pos in pages:
-        en = F.english_score(text)
+        en = PC.english_score(text)
         if en < args.min_en:
             continue
         shown += 1

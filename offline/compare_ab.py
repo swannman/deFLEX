@@ -9,10 +9,10 @@ import ast, os, re, sys
 from difflib import SequenceMatcher
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-# Shared core (flexdec.py) lives at the repo root; cover the flat install too.
+# Shared core (paging_core.py) lives at the repo root; cover the flat install too.
 sys.path.insert(0, os.path.dirname(_HERE))
 sys.path.insert(0, _HERE)
-from flexdec import english_score   # same English gate flexdec uses
+from paging_core import english_score   # same English gate the decoders use
 
 RATIO = 0.80   # fuzzy-match threshold for clustering garbled near-duplicates
 

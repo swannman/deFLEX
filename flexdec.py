@@ -119,55 +119,19 @@ PAGE_DESC = ["ENC", "UNK", "TON", "NUM", "SPN", "ALN", "BIN", "NNM"]
 FRAME_WORDS = 88                 # a fully-decoded frame is 88 datawords
 FRAME_PERIOD = 30000             # exact FLEX frame length: 1.875 s @ 16 kHz
 
-# ---- bit utilities --------------------------------------------------------
-def popcount(x):
-    return bin(x & 0xFFFFFFFF).count("1")
+# ---- shared core (BCH FEC + readability) ----------------------------------
+# popcount, the BCH(31,21) FEC + Chase soft-decoder, and the english_score
+# readability gate are protocol-neutral and shared with pocsagdec.py, so they
+# live in paging_core.py (see that module's header). _REV8/reverse_bits32 below
+# are the FLEX-specific 21-bit word unmask and stay here.
+from paging_core import (popcount, BCH_N, BCH_K, _BCH_TBL,
+                         bch3121, bch3121_chase, english_score)
 
+# ---- bit utilities (FLEX-specific) ----------------------------------------
 _REV8 = [int('{:08b}'.format(i)[::-1], 2) for i in range(256)]
 def reverse_bits32(v):
     return (_REV8[v & 0xFF] << 24) | (_REV8[(v >> 8) & 0xFF] << 16) | \
            (_REV8[(v >> 16) & 0xFF] << 8) | (_REV8[(v >> 24) & 0xFF])
-
-# ---- BCH(31,21) -----------------------------------------------------------
-# Forward error correction. BCH(31,21) means: 21 data bits are protected by 10
-# parity bits to make a 31-bit codeword (FLEX adds a 32nd even-parity bit). The
-# magic is that ANY received 31-bit word maps -- via its "syndrome" -- to the
-# nearest valid codeword, automatically correcting up to 2 flipped bits with no
-# retransmission. The syndrome is just the remainder of polynomial division by
-# the generator BCH_POLY (0x769); crucially it is LINEAR over XOR, which is what
-# lets _build_bch_table precompute every syndrome->error mapping once instead of
-# searching at decode time. This identical code protects POCSAG too (hence the
-# import in pocsagdec.py). For words still broken after 2-bit correction,
-# bch3121_chase trades CPU for reach using soft (confidence) information.
-BCH_N, BCH_K, BCH_POLY = 31, 21, 0x769
-def _even_parity(x):
-    return popcount(x) & 1
-def _syndrome(data):
-    syn = data >> 1
-    mask = 1 << (BCH_N - 1)
-    coeff = BCH_POLY << (BCH_K - 1)
-    n = BCH_K
-    while n > 0:
-        if syn & mask:
-            syn ^= coeff
-        mask >>= 1; coeff >>= 1; n -= 1
-    if _even_parity(data):
-        syn |= (1 << (BCH_N - BCH_K))
-    return syn
-# Precompute syndrome -> error-pattern table. The BCH syndrome is linear over
-# XOR (polynomial remainder + parity bit are both linear), so for any received
-# word w with S(w)=s, the weight<=2 error e satisfies S(e)=s. One table lookup
-# replaces the O(32^2) brute-force search -> ~1000x faster, enabling cheap sweeps.
-def _build_bch_table():
-    tbl = {}
-    for i in range(32):
-        e = 1 << i
-        tbl.setdefault(_syndrome(e), e)
-        for j in range(i + 1, 32):
-            e2 = e | (1 << j)
-            tbl.setdefault(_syndrome(e2), e2)
-    return tbl
-_BCH_TBL = _build_bch_table()
 
 # Dense array form of the syndrome->error table for the njit hot-path core
 # (flexdec_numba). BCH syndrome is 11 bits; 0 = no correctable error (a valid
@@ -184,48 +148,6 @@ try:
     _HAVE_NUMBA = True
 except Exception:
     _HAVE_NUMBA = False
-
-def bch3121(data):
-    """returns (corrected_word, nerr) ; nerr in {0,1,2,-1(fail)}"""
-    s = _syndrome(data)
-    if not s:
-        return data, 0
-    e = _BCH_TBL.get(s)
-    if e is None:
-        return data, -1
-    return data ^ e, popcount(e)
-
-def bch3121_chase(word, mag32, L=4):
-    """Chase-II soft-decision decode. word=32-bit hard-sliced received word;
-    mag32[b]=reliability (|soft|) of integer-bit b (b=0..31). Flip every subset
-    of the L least-reliable bits, hard-decode each test pattern, and keep the
-    valid codeword with the smallest reliability-weighted distance to `word`
-    (sum of mag over differing bits) -- the analog-weight / max-correlation
-    metric. Corrects >2 hard errors when the extra errors fall on low-confidence
-    bits, which is exactly what kills long ALN messages under hard BCH.
-    Returns (codeword, metric) or (word, -1) on failure."""
-    order = np.argsort(mag32)[:L]            # least-reliable integer-bit indices
-    best_cw = None; best_d = None
-    for combo in range(1 << L):
-        t = word
-        for bi in range(L):
-            if combo & (1 << bi):
-                t ^= (1 << int(order[bi]))
-        cw, nerr = bch3121(t)
-        if nerr < 0:
-            continue
-        diff = cw ^ word
-        d = 0.0
-        b = 0
-        while diff:
-            if diff & 1:
-                d += mag32[b]
-            diff >>= 1; b += 1
-        if best_d is None or d < best_d:
-            best_d = d; best_cw = cw
-    if best_cw is None:
-        return word, -1
-    return best_cw, best_d
 
 # ---- front end ------------------------------------------------------------
 # The front end turns a raw I/Q file into the 16 kHz demod (1-D wiggle) the rest
@@ -827,55 +749,12 @@ def deinterleave_decode(bits, mag=None, chase=False, L=4):
     return out, nfail, ncorr, nchase, conf
 
 # ---- language-likeness gate (alpha pages only) ----------------------------
-# A printable-ratio gate is too weak: aggressive Chase FEC can manufacture
-# noise frames that are 85%+ "printable" yet are clearly not text. Real pager
-# alpha bodies are English-ish: letters/spaces dominate, vowels appear in the
-# expected proportion, consonant runs are short, and control chars are rare.
-# Random 7-bit noise fails ALL of those even when it scrapes past pr>=0.85.
-# This is precisely "a strategy that fails on numeric" -- digits can't be
-# validated this way, but alpha can, which is why we only run it under --alpha.
-_VOWELS = frozenset(b"aeiouAEIOUy")
-_PUNCT  = frozenset(b".,:;/-()#@%+*=?!'\" \t\n")
-
-def english_score(body):
-    n = len(body)
-    if n == 0:
-        return 0.0
-    letters = digits = spaces = punct = ctrl = vowels = 0
-    run = maxrun = 0
-    for c in body:
-        if 65 <= c <= 90 or 97 <= c <= 122:
-            letters += 1
-            if c in _VOWELS:
-                vowels += 1; run = 0
-            else:
-                run += 1
-                if run > maxrun: maxrun = run
-        else:
-            run = 0
-            if 48 <= c <= 57: digits += 1
-            elif c == 32: spaces += 1
-            elif c in _PUNCT: punct += 1
-            elif c < 32 or c == 127: ctrl += 1
-    # Letters and spaces are the backbone of real text; digits and a little
-    # punctuation are legitimate (dates, codes) but capped so a punctuation
-    # soup like '&"Q$2i{Cf' can't masquerade as a message.
-    core = (letters + spaces) / n
-    extra = min((digits + punct) / n, 0.30)
-    cpen  = ctrl / n
-    # vowel ratio among letters: English ~0.38; pager codes run lean (call
-    # signs, "NOC", "PCB") so accept a wide band, only punish extremes.
-    if letters >= 3:
-        vr = vowels / letters
-        vscore = 1.0 if 0.18 <= vr <= 0.55 else max(0.0, 1.0 - (min(abs(vr-0.18), abs(vr-0.55)) / 0.20))
-    else:
-        vscore = 0.3
-    # long consonant runs are the strongest noise tell (random letters pile up
-    # 6-10 consonants; English almost never exceeds 4).
-    rpen = max(0.0, (maxrun - 4)) * 0.20
-    s = core + 0.5 * extra - 2.5 * cpen - rpen
-    s *= (0.4 + 0.6 * vscore)
-    return max(0.0, min(1.0, s))
+# A printable-ratio gate is too weak: aggressive Chase FEC can manufacture noise
+# frames that are 85%+ "printable" yet are clearly not text. The english_score
+# gate (letters/spaces dominate, vowels in proportion, short consonant runs,
+# rare control chars) catches that. It is protocol-neutral, shared with POCSAG,
+# and lives in paging_core.py -- imported at the top of this module. We only run
+# it under --alpha (digits can't be validated this way).
 
 # ---- frame -> pages (port of flex_frame::parse) ---------------------------
 # Now we have 88 clean datawords; this section extracts the actual pages. A FLEX

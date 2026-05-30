@@ -29,11 +29,13 @@ import time
 import numpy as np
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-# pocsagdec + flexdec sit at the repo root; in the flat /usr/local/bin install
-# they sit beside this file -- cover both layouts.
+# pocsagdec (batch core) + paging_core sit at the repo root; pocsagdec_stream
+# sits beside this file in online/. The flat /usr/local/bin install co-locates
+# everything -- cover both layouts.
 sys.path.insert(0, os.path.dirname(_HERE))
 sys.path.insert(0, _HERE)
 import pocsagdec as P
+import pocsagdec_stream as PS   # POCSAGStream (streaming wrapper)
 
 FREQ = 152_007_500          # SNO911 fire/EMS alphanumeric dispatch
 CARRIER = 152007500         # log carrier id (also the log filename stem)
@@ -72,7 +74,7 @@ def run_file(cfile, in_rate, log_path=None):
     """Feed a capture through POCSAGStream exactly as the live path would."""
     on_page = make_on_page(log_path)
     x = np.fromfile(cfile, dtype=np.complex64)
-    ps = P.POCSAGStream(in_rate=in_rate, on_page=on_page)
+    ps = PS.POCSAGStream(in_rate=in_rate, on_page=on_page)
     chunk = int(2.0 * in_rate)
     for i in range(0, len(x), chunk):
         ps.feed(x[i:i + chunk])
@@ -121,7 +123,7 @@ def run_live(log_dir, driver="rtlsdr"):
                     pass
             return len(x)
 
-    ps = P.POCSAGStream(in_rate=RX_RATE, on_page=make_on_page(log_path))
+    ps = PS.POCSAGStream(in_rate=RX_RATE, on_page=make_on_page(log_path))
 
     def worker():
         while True:

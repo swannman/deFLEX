@@ -27,6 +27,8 @@ RSPdx @ 930.7625 MHz, 2.5 MS/s         (one shared GNU Radio flowgraph, parent p
 | `flex_inmem_mp.py` | **production**: SDR → freq-xlate → ring → **per-carrier process** → StreamDecoder (`--live`); also `--file` parity mode |
 | `flex_inmem.py` | threaded variant (one thread per carrier): GIL-bound, superseded by `flex_inmem_mp.py`; still useful for `--file` parity and as the single source of the SDR/carrier constants |
 | `flex_stream_live.py` | standalone single-carrier tail of a growing `.cfile` (dev/debug) |
+| `pocsagdec_stream.py` | `POCSAGStream`: the POCSAG analogue of `flexdec_stream.py` — overlapped-batch replay of `pocsagdec.py` with emit-region exactly-once emission |
+| `pocsag_receiver.py` | live POCSAG receiver (152.0075 MHz SNO911 dispatch) feeding `POCSAGStream` |
 | `flex-receiver-flexdec.service` | systemd unit (installed as `flex-receiver.service`) |
 | `legacy/flex_7ch.py` | **retired** 7-channel multimon flowgraph (2.646 MS/s → FM-discriminator → FIFO) |
 

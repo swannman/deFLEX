@@ -4,7 +4,7 @@ The **online** side of flexdec: the real-time path that turns the frozen batch
 decoder (`flexdec.py`, at the repo root) into a continuously-running multi-carrier
 receiver fed directly by an SDR — **no intermediate files, no multimon-ng.**
 
-This is the production FLEX receiver on **p340** (`flex-receiver.service`). As of
+This is the production FLEX receiver on the production host (`flex-receiver.service`). As of
 **2026-05-29** it replaced the legacy multimon-ng flowgraph (kept for reference
 in `legacy/`). The production path is the **multiprocessing** variant
 (`flex_inmem_mp.py`) — one OS process per carrier to beat the GIL (see below);
@@ -28,7 +28,7 @@ RSPdx @ 930.7625 MHz, 2.5 MS/s         (one shared GNU Radio flowgraph, parent p
 | `flex_inmem.py` | threaded variant (one thread per carrier): GIL-bound, superseded by `flex_inmem_mp.py`; still useful for `--file` parity and as the single source of the SDR/carrier constants |
 | `flex_stream_live.py` | standalone single-carrier tail of a growing `.cfile` (dev/debug) |
 | `pocsagdec_stream.py` | `POCSAGStream`: the POCSAG analogue of `flexdec_stream.py` — overlapped-batch replay of `pocsagdec.py` with emit-region exactly-once emission |
-| `pocsag_receiver.py` | live POCSAG receiver (152.0075 MHz SNO911 dispatch) feeding `POCSAGStream` |
+| `pocsag_receiver.py` | live POCSAG receiver (VHF fire/EMS dispatch) feeding `POCSAGStream` |
 | `flex-receiver-flexdec.service` | systemd unit (installed as `flex-receiver.service`) |
 | `legacy/flex_7ch.py` | **retired** 7-channel multimon flowgraph (2.646 MS/s → FM-discriminator → FIFO) |
 
@@ -175,9 +175,10 @@ install where everything is co-located.
 
 ### systemd
 
-`flex-receiver-flexdec.service` is installed as `flex-receiver.service` on p340:
+`flex-receiver-flexdec.service` is installed as `flex-receiver.service` on the
+production host:
 
-- `User=swannman`, `WorkingDirectory=/usr/local/bin`,
+- `User=<user>`, `WorkingDirectory=/usr/local/bin`,
   `ExecStart=/usr/bin/python3 /usr/local/bin/flex_inmem_mp.py --live`
 - `CPUQuota=600%`, `KillMode=control-group` (the per-carrier worker processes live
   in the unit cgroup, so `systemctl stop` reaps the whole group)
@@ -186,7 +187,7 @@ install where everything is co-located.
 
 Logs land in `/var/log/flex/<carrier>.flexdec.log` in the legacy
 `<ts> FLEX|<carrier>|<slot>|<tier>|0|ALN|<body>` shape, so the existing web feed
-(`flex-tail.service`, FastAPI/uvicorn on `http://192.168.5.176:8091/`) parses
+(`flex-tail.service`, FastAPI/uvicorn on `http://<host>:8091/`) parses
 them with **no server change**.
 
 ---

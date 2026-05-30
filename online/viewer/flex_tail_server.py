@@ -15,7 +15,7 @@ Post-processing (server-side, using metadata that is NOT exposed to the page):
     capcode are concatenated; the joined message is emitted once a K/F arrives
     for the capcode or STITCH_TIMEOUT elapses.
 
-URL:  http://192.168.5.176:8091/   (or http://p340.local:8091/)
+URL:  http://<host>:8091/
 """
 import asyncio
 import glob
@@ -125,7 +125,7 @@ def looks_encoded(body: str) -> bool:
     while exempting URLs/emails (which are legitimately long and space-free).
     A real email/URL anywhere in the body (not just the longest token) means
     it's a structured message — e.g. fab alarm pages whose long token is a
-    machine ID sitting next to a clean 'ALARMSVR@tsmc.com'."""
+    machine ID sitting next to a clean 'alarms@example.net'."""
     b = body.replace("\\n", " ").replace("\\r", " ").replace("\\t", " ").strip()
     if not b:
         return False

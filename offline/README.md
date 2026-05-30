@@ -15,14 +15,14 @@ IQ capture. This is where the algorithm was designed, validated against
 The headline result: on a frozen 120 s benchmark capture, flexdec produces
 **FEC-validated, garbage-free** alpha decodes that are cleaner than multimon's,
 and it **decisively wins on weak carriers** — recovering a lab-temperature
-broadcast (`TempTrak`) at −27.5 dB that multimon renders as noise.
+broadcast at −27.5 dB that multimon renders as noise.
 
 ---
 
 ## The signal
 
 FLEX is a one-way paging protocol (TIA-1500). The benchmark carrier
-(929.6125 MHz, the Spok network in the Seattle area) is **mode 3: 3200 baud,
+(929.6125 MHz, the Spok network) is **mode 3: 3200 baud,
 4-level FSK**, **inverted polarity**.
 
 | Parameter | Value | Notes |
@@ -145,7 +145,7 @@ discard NUM/NNM, then gate alpha bodies on an **`english_score(body)`** that
 Floor `ALPHA_EN_OK = 0.60`: under `--alpha`, an A/B page scoring below that is
 demoted to C. This makes the **aggressive full-grid comb safe** — Chase-forged
 noise is rejected, real text is kept, and genuinely-English-but-garbled messages
-(TempTrak) are promoted to trustworthy.
+(e.g. the weak lab-temperature broadcast) are promoted to trustworthy.
 
 ---
 
@@ -167,28 +167,29 @@ recall for **higher fidelity** (its bodies are BCH/Chase-validated and
 garbage-free by construction; multimon prints whatever it sliced, errors and
 all) and a **clear win on the weak carrier**.
 
-The starkest single example — same page, both decoders, at center:
+The starkest single example — same page, both decoders, at center (synthetic
+illustration of the clean-vs-garbled contrast; identifiers are placeholders):
 
 ```
-flexdec : From: HGMS@onsemi.com Subject: Ignition Alarm Notification - At
-          08:29:10, alarm "Alarm" at "default/HGMS/GCs/GC-52/Controller/Right/
-          Alarms/Exhaust/Status is in Alarm" transitioned to Active.
+flexdec : From: alarms@example.net Subject: Alarm Notification - At
+          08:29:10, alarm "Alarm" at "default/SiteA/Unit/Controller/Right/
+          Alarms/Status is in Alarm" transitioned to Active.
 
-multimon: oO:$LGMS@onseoa.com Swbjgat: I'nx4yon AlarM ^gthfisAtyol - At 08:29:10,
-          alarm$"Alarm" at "default/HGMS/GCs/GC-5;/Condroloer/Right/Alarms/
-          Exhaust/[tctuc ic in ELape" transktionmd }o Active.
+multimon: oO:$alaros@exaople.nef Swbjgat: AlarM ^gthfisAtyol - At 08:29:10,
+          alarm$"Alarm" at "default/SiteA/Unit/Condroloer/Right/Alarms/
+          [tctuc ic in ELape" transktionmd }o Active.
 ```
 
-And the weak-carrier win — `TempTrak` lab-temperature broadcast at +50k:
+And the weak-carrier win — a lab-temperature broadcast at +50k (placeholders):
 
 ```
-flexdec : From: TempTrak@luminishealth.ost - LAB ROOM TEMP 5/28/2026 11:30:00 PM
+flexdec : From: sensors@example.net - LAB ROOM TEMP 5/28/2026 11:30:00 PM
           19.8 20.0 23.9 5/28/2026 10:30:00 PM
 multimon: 30:30z00 PM [62]Yof@cVfB]?3fYL}:3x}?~9ma?x{k...   (dissolves into noise)
 ```
 
 multimon's center count is also inflated by base64/encrypted blobs and ~5
-error-different copies of the same EZCall page; flexdec emits each message once,
+error-different copies of the same page; flexdec emits each message once,
 clean, or not at all.
 
 ### Why multimon still leads on center recall
@@ -223,9 +224,9 @@ benchmark result bit-for-bit).
 **Findings:**
 
 - **Every page flexdec marks trustworthy is genuinely clean** — real
-  hospital/enterprise alpha across all five FLEX carriers (Harborview "Rapid
-  Response room 462", "ACTUAL EVENT … Full Trauma … ER 8", Epic EVS logistics,
-  UW "ready for turnover", door/alarm notifications).
+  hospital/enterprise alpha across all five FLEX carriers (rapid-response room
+  alerts, trauma activations, facilities/EVS logistics, equipment-turnover
+  notices, door/alarm notifications).
 - **Calibration is near-perfect:** the count of readable bodies
   (`--dump-readable`, en≥0.60 & ≥85% printable, any tier) ≈ the trustworthy A+B
   count on every carrier → the large `C_suspect` bulk is genuinely garbled, not

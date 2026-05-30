@@ -1,6 +1,6 @@
 """POCSAG (CCIR Radio Paging Code No. 1) alpha decoder.
 
-Sibling to flexdec.py for the p340 paging rig. Focus: alphanumeric pages only
+Sibling to flexdec.py for the paging rig. Focus: alphanumeric pages only
 (the 7-bit-ASCII message type) -- numeric/tone pages are ignored.
 
 =============================================================================
@@ -125,7 +125,7 @@ CW_BITS = 32          # every POCSAG codeword is 32 bits
 BATCH_CWS = 16        # a batch = 8 frames x 2 codewords = 16 codewords after the FSC
 PREAMBLE_MIN = 0      # we lock on the FSC directly; the preamble only helps timing
 
-EN_FLOOR_DEFAULT = 0.45   # english_score gate; lowest real SNO911 page = 0.49
+EN_FLOOR_DEFAULT = 0.45   # english_score gate; lowest real dispatch page = 0.49
 ALPHA_MIN_LEN = 12        # real dispatches run 34+ chars. Sub-12 readable
                           # strings ('er St', 'Qf') are FEC fragments, never
                           # pages -- english_score alone rates a 2-char run 1.0.

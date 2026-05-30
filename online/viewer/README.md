@@ -2,8 +2,8 @@
 
 Live terminal-style web feed of decoded FLEX pager messages. Tails the logs
 written by `flex-receiver.service` and streams clean message bodies to browsers
-over a WebSocket. Runs on p340 as `flex-tail.service` at
-`http://p340.local:8091/`.
+over a WebSocket. Runs on the production host as `flex-tail.service` at
+`http://<host>:8091/`.
 
 ## Files
 
@@ -28,7 +28,7 @@ and fragment metadata are never sent to the client. Server-side processing:
   base64/encrypted blobs (a space-free run ≥24 chars, or a single ≥20-char
   ≥90%-base64 token) as not-readable so the page can hide them. A real
   email/URL **anywhere** in the body exempts it (so fab alarm pages whose long
-  token is a machine ID next to a clean `ALARMSVR@tsmc.com` are shown). The
+  token is a machine ID next to a clean `alarms@example.net` are shown). The
   email/URL test requires a real `word@word.tld` / scheme / `host/path` shape so
   FEC garble carrying a stray `@` does not falsely exempt a blob.
 - **`DROP_SUBSTRINGS`** — drops "test page" heartbeats entirely.
@@ -37,7 +37,7 @@ and fragment metadata are never sent to the client. Server-side processing:
 
 ## Run / deploy
 
-Uses the shared `gridstream-waterfall-venv` (FastAPI + uvicorn). On p340:
+Uses the shared `gridstream-waterfall-venv` (FastAPI + uvicorn). On the host:
 
 ```
 sudo cp flex_tail_server.py /usr/local/bin/

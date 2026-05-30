@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dedicated POCSAG alpha-paging receiver for 152.0075 MHz (SNO911 fire/EMS).
+"""Dedicated POCSAG alpha-paging receiver for a VHF fire/EMS dispatch channel.
 
 Sibling of flex_inmem_mp.py, but POCSAG on VHF lives ~780 MHz from the 929-932
 FLEX band and so CANNOT share the RSPdx tuner pass -- it needs its OWN SDR. The
@@ -37,7 +37,7 @@ sys.path.insert(0, _HERE)
 import pocsagdec as P
 import pocsagdec_stream as PS   # POCSAGStream (streaming wrapper)
 
-FREQ = 152_007_500          # SNO911 fire/EMS alphanumeric dispatch
+FREQ = 152_007_500          # VHF fire/EMS alphanumeric dispatch
 CARRIER = 152007500         # log carrier id (also the log filename stem)
 RX_RATE = 250000            # RTL-SDR low-rate regime; POCSAGStream resamples to 9600
 EN_FLOOR = 0.45             # english_score floor inside P.is_clean_alpha. 0.45

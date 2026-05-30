@@ -16,7 +16,7 @@ core now runs **live and continuously** on all five active carriers.
 ## The signal
 
 FLEX is a one-way paging protocol. The benchmark carrier (929.6125 MHz, Spok
-network, Seattle area) is **mode 3: 3200 baud, 4-level FSK, inverted polarity**.
+network) is **mode 3: 3200 baud, 4-level FSK, inverted polarity**.
 
 | Parameter | Value | Notes |
 |---|---|---|
@@ -53,7 +53,7 @@ online/             ← live real-time receivers   (see online/README.md)
   flex_inmem_mp.py      production: SDR -> freq-xlate -> ring -> per-carrier PROCESS -> decoder
   flex_inmem.py         threaded variant (GIL-bound), superseded by flex_inmem_mp.py
   flex_stream_live.py   standalone single-carrier .cfile tail (dev)
-  pocsag_receiver.py    live POCSAG receiver (152.0075 SNO911 dispatch)
+  pocsag_receiver.py    live POCSAG receiver (VHF fire/EMS dispatch)
   flex-receiver-flexdec.service
   legacy/
     flex_7ch.py       retired multimon-ng flowgraph (kept for A/B provenance)
@@ -80,7 +80,7 @@ online/             ← live real-time receivers   (see online/README.md)
 ## Status
 
 The live in-memory flexdec receiver **replaced multimon-ng in production on
-2026-05-29** (`flex-receiver.service` on p340): RSPdx @ 2.5 MS/s → 5 carriers →
+2026-05-29** (`flex-receiver.service` on the production host): RSPdx @ 2.5 MS/s → 5 carriers →
 one **`StreamDecoder` process per carrier** (`flex_inmem_mp.py`, multiprocessing
 to beat the GIL) → `/var/log/flex`, feeding the existing web viewer with no
 server change. See [`online/README.md`](online/README.md) for the full design and

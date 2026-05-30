@@ -6,18 +6,104 @@ against per-frame adaptive level estimation and BCH-gated output.
 
 Usage: flexdec.py <cfile> [slicer] [--diag]
   slicer = fixed | perframe   (default perframe)
+
+=============================================================================
+A PRIMER FOR THE READER WHO IS A SOFTWARE ENGINEER BUT NOT AN RF ENGINEER
+=============================================================================
+FLEX is the Motorola paging protocol (spec TIA-1500) that carries the messages
+on the 929-932 MHz pager band. This decoder turns a recording of raw radio
+samples into the text of those pages, in pure numpy/scipy. If pocsagdec.py is
+the gentle introduction, this is the graduate course -- FLEX is markedly harder
+than POCSAG, and most of the cleverness here exists to claw real pages out of
+WEAK, fading carriers. Read pocsagdec.py's primer first; the radio fundamentals
+(FSK, I/Q samples, FM demodulation, symbol timing, BCH error correction) are
+explained there and assumed here.
+
+What makes FLEX harder than POCSAG:
+
+1. FOUR levels, not two. POCSAG is 2-FSK (one bit per symbol). FLEX's richest
+   modes are 4-FSK: the carrier is shifted to one of FOUR frequencies
+   (-4800, -1600, +1600, +4800 Hz; see FLEX_TONES), so each symbol carries TWO
+   bits. A 4-level signal has three decision boundaries instead of one, and the
+   four levels are NOT symmetric in practice, which is why we estimate them
+   adaptively (two_means / kmeans4) instead of using fixed thresholds.
+
+2. MULTIPLE modes on the same channel. FLEX runs at 1600 OR 3200 baud, 2 OR 4
+   level, and announces which via a sync word at the start of every frame
+   (FLEX_MODES). The 3200-baud modes interleave two bit-streams onto alternating
+   symbols, which we must de-multiplex (demux_phases).
+
+3. STRICT framing. FLEX frames are rigidly periodic: one every 1.875 s, i.e.
+   exactly 30000 samples at our 16 kHz symbol-clock rate (FRAME_PERIOD), 88
+   words per frame. That periodicity is a gift -- once we know the phase of the
+   frame grid we can predict where EVERY frame sits, even ones too faded to
+   detect on their own (add_comb_frames).
+
+4. INTERLEAVING. FLEX doesn't send a codeword's 32 bits consecutively; it
+   spreads 8 codewords across a 256-bit block in a fixed interleave pattern, so
+   that a burst of noise damages one bit in each of 8 words (all individually
+   correctable) instead of wiping out one whole word (uncorrectable). We undo
+   that shuffle in deinterleave_decode before BCH.
+
+5. ERROR CORRECTION is the same BCH(31,21) as POCSAG (this is why pocsagdec can
+   import it), plus optional Chase soft-decision decoding for words that fail
+   hard decode.
+
+THE DETECTOR HAS THREE "TIERS" (selectable; we A/B them honestly):
+  * The default FM-DISCRIMINATOR path: FM-demodulate to a 1-D wiggle, then slice
+    its amplitude into 4 levels. Simple and robust; what gr-pager / multimon do.
+  * Tier 1, the MATCHED-FILTER BANK (mf_bank_mag, --mfbank): instead of
+    demodulating, correlate the complex signal against each of the 4 expected
+    tones over each symbol and pick the strongest. This is the textbook OPTIMAL
+    noncoherent detector for orthogonal FSK and squeezes out marginally weaker
+    pages.
+  * Tier 2, a per-frame CARRIER-OFFSET NULL (est_cfo): re-centre each frame's
+    tones to cancel residual tuning error.
+  * Tier 3, COHERENT detection (coherent_metric, --coh): track the carrier phase
+    and exploit it. EMPIRICALLY THIS LOSES for FLEX (documented at length in
+    coherent_metric) -- kept only as an instructive dead-end.
+
+ACQUISITION (finding frames) has two strategies:
+  * FlexSync: a faithful port of the classic shift-register sync state machine
+    (matches gr-pager bit-for-bit). Locks the cleaner frames.
+  * corr_frames: a matched correlator against the known 64-bit sync word, which
+    integrates the whole word and so survives many bit errors -- far better on
+    weak carriers. Combined with grid_phase + add_comb_frames it recovers frames
+    the state machine never sees.
+
+OUTPUT is confidence-graded, never hard-gated: every page is emitted but tagged
+A/B/C/D by how much the FEC had to work and (for alpha pages) whether the body
+reads as English (english_score). The caller decides what to trust.
+
+The `main()` at the bottom is a research harness -- it wires all the above
+together behind command-line flags so we can A/B any combination against a
+frozen capture. The live receivers import the building blocks directly.
 """
 import sys
 from math import gcd
 import numpy as np
 from scipy import signal
 
-SAMP = 250000
+# ---------------------------------------------------------------------------
+# PROTOCOL + SAMPLE-RATE CONSTANTS
+# ---------------------------------------------------------------------------
+# Two sample rates live in this file. SAMP (250 kHz) is the rate of the complex
+# I/Q the SDR captured -- we keep the front end at this rate. FS (16 kHz) is the
+# lower "symbol-clock" rate we resample the demod to, chosen because it is a
+# clean multiple of both baud rates (16000/1600 = 10, 16000/3200 = 5 samples per
+# symbol) and is what gr-pager used, so our timing math matches the reference.
+SAMP = 250000                    # I/Q capture rate (Hz)
 FS = 16000                       # symbol-clock sample rate (gr-pager uses this)
-SPB = 10                         # samples/baud @ 1600 baud
-DEVIATION = 4800.0
+SPB = 10                         # samples/baud @ 1600 baud (= FS/1600)
+DEVIATION = 4800.0               # outermost FSK tone offset from center (Hz)
+# Every FLEX frame starts with a 64-bit sync word = code_hi(16) | SYNC_MARKER(32)
+# | code_lo(16). The fixed middle 32 bits (SYNC_MARKER) flag "a frame begins
+# here"; the surrounding code bits identify the MODE (baud/levels). We detect a
+# frame by matching the marker, then read the mode from the code bits.
 SYNC_MARKER = 0xA6C6AAAA
 MASK64 = (1 << 64) - 1
+# Each entry: (mode sync code A-word, baud rate, number of FSK levels). The
+# decoder learns which one is on air from the sync word rather than being told.
 # (sync_A_word, baud, levels)
 FLEX_MODES = [
     (0x870C78F3, 1600, 2),
@@ -26,9 +112,11 @@ FLEX_MODES = [
     (0xDEA0215F, 3200, 4),
     (0x4C7CB383, 3200, 4),
 ]
-FLEX_BCD = "0123456789 U -]["    # 16 entries, index 0-15
+FLEX_BCD = "0123456789 U -]["    # numeric-page symbol table: 16 entries, index 0-15
+# Page content types carried in the vector word; we ultimately care about the
+# alpha ones (SPN/ALN). ENC=encrypted, TON=tone-only, NUM/NNM=numeric, BIN=binary.
 PAGE_DESC = ["ENC", "UNK", "TON", "NUM", "SPN", "ALN", "BIN", "NNM"]
-FRAME_WORDS = 88
+FRAME_WORDS = 88                 # a fully-decoded frame is 88 datawords
 FRAME_PERIOD = 30000             # exact FLEX frame length: 1.875 s @ 16 kHz
 
 # ---- bit utilities --------------------------------------------------------
@@ -41,6 +129,16 @@ def reverse_bits32(v):
            (_REV8[(v >> 16) & 0xFF] << 8) | (_REV8[(v >> 24) & 0xFF])
 
 # ---- BCH(31,21) -----------------------------------------------------------
+# Forward error correction. BCH(31,21) means: 21 data bits are protected by 10
+# parity bits to make a 31-bit codeword (FLEX adds a 32nd even-parity bit). The
+# magic is that ANY received 31-bit word maps -- via its "syndrome" -- to the
+# nearest valid codeword, automatically correcting up to 2 flipped bits with no
+# retransmission. The syndrome is just the remainder of polynomial division by
+# the generator BCH_POLY (0x769); crucially it is LINEAR over XOR, which is what
+# lets _build_bch_table precompute every syndrome->error mapping once instead of
+# searching at decode time. This identical code protects POCSAG too (hence the
+# import in pocsagdec.py). For words still broken after 2-bit correction,
+# bch3121_chase trades CPU for reach using soft (confidence) information.
 BCH_N, BCH_K, BCH_POLY = 31, 21, 0x769
 def _even_parity(x):
     return popcount(x) & 1
@@ -130,6 +228,13 @@ def bch3121_chase(word, mag32, L=4):
     return best_cw, best_d
 
 # ---- front end ------------------------------------------------------------
+# The front end turns a raw I/Q file into the 16 kHz demod (1-D wiggle) the rest
+# of the decoder slices into symbols. Three steps: (1) load_baseband selects ONE
+# channel out of the capture -- it can shift any carrier within the captured band
+# down to DC ("de-rotate by cfo"), low-pass to isolate it, and resample odd input
+# rates to our internal 250 kHz; (2) demod_from_baseband FM-demodulates and
+# resamples to 16 kHz; (3) an optional one-symbol "integrate-and-dump" matched
+# filter (a boxcar average) maximises signal-to-noise at the symbol centre.
 def load_baseband(cfile, cfo=0.0, lpf=12000.0, in_rate=None):
     """Read complex I/Q, optional CFO de-rotation, channel LPF. Returns the
     band-limited complex baseband (used both for FM demod and the MF bank).
@@ -277,6 +382,14 @@ def coherent_metric(C, baud, inv=False, alpha=0.05):
         R[:, k] = (C[:, k] * np.exp(-1j * (theta + nmod + dphi[k] / 2.0))).real
     return R
 
+# --- 4 levels -> 2 bits, with confidence -----------------------------------
+# A 4-level symbol carries 2 bits. FLEX uses a Gray-style map so that the two
+# bits have clean physical meanings: bit_a = "is the frequency negative?" (the
+# sign / inner-vs-outer split at the midpoint) and bit_b = "is it an OUTER tone?"
+# (|freq| large). Decoding to bits is easy; the VALUE here is the "soft" part --
+# we also return how CONFIDENT each bit is (mag_a, mag_b = distance from the
+# decision boundary). Those confidences are what feed Chase soft-decode later:
+# a bit decided right at the boundary is the first one Chase will try flipping.
 def mfbank_softbits(mag):
     """4 tone magnitudes -> (bit_a,bit_b,mag_a,mag_b) via max-log soft metrics.
     level 0..3 (ascending freq): bit_a=(level<2)=freq<0; bit_b=(level in {0,3})
@@ -302,6 +415,14 @@ def demux_phases(bit_a, bit_b, mag_a, mag_b, baud):
             [mag_a[ev], mag_b[ev], mag_a[od], mag_b[od]])
 
 # ---- adaptive level estimation -------------------------------------------
+# To slice the FM-discriminator signal into levels we need to know WHERE the
+# levels actually sit. The textbook assumption (symmetric levels at +/-2, +/-6)
+# is wrong in practice: tuning offset, filter group delay and FM-discriminator
+# nonlinearity make the real four-level constellation asymmetric and drifting.
+# So instead of fixed thresholds we LEARN the level centres from the data with
+# tiny 1-D k-means: two_means finds the inner/outer split for 2-level decisions,
+# kmeans4 finds all four centres for full 4-level slicing. This is the single
+# biggest accuracy win over the legacy fixed-threshold slicer.
 def two_means(mags, it=20):
     """1-D 2-means on magnitudes -> (low_center, high_center)."""
     lo, hi = np.percentile(mags, 25), np.percentile(mags, 75)
@@ -443,6 +564,16 @@ def corr_frames(demod, p0_offset=1517.0, grid=True, score_hi=0.6, include_thr=0.
     return frames
 
 # ---- sync state machine ---------------------------------------------------
+# The classic acquisition method, ported faithfully from gr-pager so it matches
+# the reference bit-for-bit. It is a shift register that walks the demod one
+# sample at a time looking for the sync marker; when it sees one it measures the
+# bit timing, reads the mode, skips the rest of the sync overhead (SYNC1/SYNC2),
+# then records exactly one frame's worth of raw symbol values and goes idle. It
+# is precise but UNFORGIVING -- a sync word with too many bit errors is missed
+# entirely, which is why corr_frames (the matched-correlator alternative above)
+# beats it on weak carriers. The states below are: IDLE (hunting for sync) ->
+# SYNCING (inside the sync run) -> SYNC1/SYNC2 (fixed overhead) -> DATA
+# (collecting the frame), then reset.
 ST_IDLE, ST_SYNCING, ST_SYNC1, ST_SYNC2, ST_DATA = range(5)
 
 class FlexSync:
@@ -540,6 +671,10 @@ class FlexSync:
         return self.frames
 
 # ---- symbol -> phase bits -> datawords ------------------------------------
+# The chain in this section: raw symbol values -> hard bits + reliabilities
+# (the *_phases / slice_soft sliceres) -> de-multiplex the 3200-baud A/C streams
+# into FLEX's 4 "phases" (independent interleaved sub-channels) -> deinterleave
+# each phase's 256-bit blocks back into 8 codewords -> BCH-correct -> datawords.
 def syms_to_phases(syms, baud, levels, thr, dc):
     v = syms - dc
     pa, pb, pc, pd = [], [], [], []
@@ -619,7 +754,20 @@ def decode_phases(phases, mags, chase=False):
     return wordsets, confsets, nf, nc, nch
 
 def deinterleave_decode(bits, mag=None, chase=False, L=4):
-    """bits: uint8 -> (datawords, n_bch_fail, n_corrected, n_chase_recovered, conf).
+    """Undo FLEX's bit interleave, then BCH-decode the recovered codewords.
+
+    WHY interleaving exists: radio errors come in BURSTS (a fade knocks out
+    several consecutive bits). BCH can fix only 2 errors per 32-bit word, so a
+    burst landing in one word would be fatal. FLEX defends against this by
+    SPREADING 8 codewords across a 256-bit block: bit (i*8 + j) of the block is
+    bit i of codeword j. Consecutive on-air bits therefore belong to DIFFERENT
+    codewords, so a burst becomes one isolated (correctable) error in each of
+    several words instead of many errors in one. This function reverses that
+    shuffle -- read column j down the 256-bit block to rebuild codeword j -- then
+    runs BCH (and Chase on failures). The numba fast path does the identical
+    thing in compiled code for the live receiver's throughput.
+
+    bits: uint8 -> (datawords, n_bch_fail, n_corrected, n_chase_recovered, conf).
     conf[k] = (status, margin) aligned to datawords: status 0=clean syndrome,
     1/2=BCH-corrected, 3=Chase-recovered, -1=uncorrectable; margin=mean soft-bit
     reliability for that word, normalized to the per-call median (~1.0 typical).
@@ -730,6 +878,18 @@ def english_score(body):
     return max(0.0, min(1.0, s))
 
 # ---- frame -> pages (port of flex_frame::parse) ---------------------------
+# Now we have 88 clean datawords; this section extracts the actual pages. A FLEX
+# frame is self-describing, like a tiny filesystem:
+#   * word 0 is the Block Info Word (BIW): it says where the address field ends
+#     and the vector field begins (aoffset / voffset).
+#   * the ADDRESS field lists capcodes (recipient IDs); parse_capcode rebuilds
+#     each, handling both short and long address forms.
+#   * for each address there is a paired VECTOR word that says what TYPE the page
+#     is (alpha / numeric / tone) and WHERE its message words live in the frame.
+#   * parse_alpha / parse_numeric then walk those message words and unpack the
+#     characters (alpha = 7-bit ASCII; numeric = 4-bit BCD via FLEX_BCD).
+# parse_frame ties it together and attaches a per-page confidence (pconf) built
+# from the FEC status of exactly the words that page touched.
 def is_alpha(t): return t in (4, 5)      # SPN, ALN
 def is_numeric(t): return t in (3, 7)    # NUM, NNM
 def is_tone(t): return t == 2
@@ -910,6 +1070,14 @@ def add_comb_frames(frames, total_len, verbose=False):
     return out
 
 # ---- driver ---------------------------------------------------------------
+# RESEARCH HARNESS, not the production entry point. main() wires every option
+# above behind command-line flags so we can A/B any combination (FM-disc vs
+# matched-filter bank, hard-sync vs correlator vs comb, fixed vs adaptive slicer,
+# Chase on/off, coherent on/off) against a frozen capture and compare decode
+# counts. The live receivers (flex_inmem_mp.py etc.) instead import the building
+# blocks directly. The big decision loop at the end grades every page A/B/C/D by
+# how hard the FEC worked and whether its body reads as English -- it never hard-
+# drops a page, it labels confidence and lets the caller choose.
 def main():
     cfile = sys.argv[1] if len(sys.argv) > 1 else "/tmp/flex_ab/iq_929612500_250k.cfile"
     slicer = "perframe"

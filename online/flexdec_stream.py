@@ -1,21 +1,43 @@
 #!/usr/bin/env python3
 """Streaming FLEX decoder built ON TOP of the validated batch core (flexdec.py).
 
+=============================================================================
+WHAT THIS FILE IS, FOR THE NON-RF READER
+=============================================================================
+flexdec.py decodes a whole recorded FILE at once. This file makes the same
+decoder run LIVE, where samples arrive forever in small chunks from the SDR and
+each page must be emitted exactly once, as soon as enough of it has arrived.
+
+The key design choice: we do NOT rewrite the decoder as a stateful streaming
+pipeline (which would risk drifting out of agreement with the trusted offline
+results). Instead we reuse flexdec.py's leaf functions UNCHANGED and only add
+"streaming scaffolding" around them -- a sample buffer, a sliding-window
+scheduler, and de-duplication. Each window is just a short recording that we
+hand to the same batch decode. This is the FLEX analogue of POCSAGStream in
+pocsagdec.py, and it uses the same overlap-save trick (read that class's comment
+for the plain-English version):
+
+  * A FLEX frame is self-contained and the frames are rigidly periodic
+    (FRAME_PERIOD = 30000 @ 16 kHz = 1.875 s) on the transmitter's clock. So we
+    can slide a window over the stream, re-run the batch decode on each window,
+    and tag every decoded frame with its ABSOLUTE frame number ("slot") computed
+    from the window's position. Because the slot is global, the same frame seen
+    in two overlapping windows gets the same slot.
+  * Windows overlap by >= one frame, so every frame is fully contained in at
+    least one window (never sliced at an edge).
+  * De-duplication on (slot, type, body) then collapses the repeats from the
+    overlap, so each logical page is emitted once. (POCSAG avoided dedup via a
+    strict emit-region rule; FLEX uses explicit dedup because its periodic slot
+    number gives a perfect, drift-free key -- the cleaner tool for this protocol.)
+
+This "overlapped batch + dedup" approach is provably equivalent to the offline
+run -- there is no resampler or PLL state that could drift between chunks.
+
 flexdec.py is the frozen A/B baseline; this module imports it and reuses every
-leaf DSP/FEC function unchanged. The only thing it adds is the *streaming
-scaffolding*: a complex-baseband ring buffer, an overlapped-window scheduler,
-and per-frame-slot dedup. The actual symbol decode replays flexdec's main()
+leaf DSP/FEC function unchanged. The symbol decode replays flexdec's main()
 per-frame loop verbatim (matched-filter bank + per-frame CFO null + Chase-II
 soft FEC + the alpha English-likeness tier gate), so a streamed run produces
 exactly the same trustworthy A/B messages a batch run would.
-
-Why "overlapped batch + dedup" instead of a stateful streaming demod:
-  * FLEX is strictly periodic (FRAME_PERIOD = 30000 @ 16 kHz = 1.875 s) on a
-    shared transmitter clock. A frame is self-contained, so re-running the
-    validated batch decode on a sliding window and de-duplicating by absolute
-    frame slot is provably equivalent to batch -- no resampler state to drift.
-  * The window overlaps by >= one frame so every frame is fully contained in at
-    least one window; dedup (slot, type, body) collapses the repeats.
 
 Validation target: replay iq_929612500_250k.cfile (already complex @ 250k, no
 resampling) in chunks; the streamed A/B set must be a superset of the batch set.
@@ -80,6 +102,15 @@ def _classify(typ, body, pc, cfg):
     return t, pr, en
 
 
+# ---------------------------------------------------------------------------
+# THE PER-WINDOW DECODE
+# ---------------------------------------------------------------------------
+# decode_window is the bridge: it takes one window of complex samples and runs
+# flexdec's offline frame loop on it. The body is deliberately a near-verbatim
+# copy of flexdec.main()'s loop (same acquisition, sweep, slicer, MF bank, Chase)
+# so the streamed and offline paths can never silently diverge. The ONE addition
+# is computing each frame's absolute `slot` from the window offset s0 -- that
+# global slot number is what makes cross-window de-duplication exact.
 def decode_window(xb, s0, cfg):
     """Decode one complex-baseband window. `s0` = absolute index (250k samples)
     of xb[0] in the stream, used to assign each frame its global slot number.
@@ -199,6 +230,16 @@ def decode_window(xb, s0, cfg):
     return results
 
 
+# ---------------------------------------------------------------------------
+# THE STREAMING SCHEDULER
+# ---------------------------------------------------------------------------
+# StreamDecoder owns the buffer and decides WHEN to decode. It accumulates fed
+# chunks, and once it holds a full window it decodes that window, emits the
+# fresh (deduped, A/B-grade) pages, then slides forward by `advance` (< window,
+# so consecutive windows overlap). On flush() it also drains the short tail.
+# The performance-critical detail is _merge_pending: we concatenate buffered
+# chunks once per window rather than once per fed chunk, because the buffer can
+# be ~120 MB and a naive per-chunk concat made that memcpy dominate live CPU.
 class StreamDecoder:
     """Feed complex baseband (already channelized to one carrier at cfg['in_rate'],
     default 250k) in arbitrary-sized chunks; emits trustworthy A/B alpha pages

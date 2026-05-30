@@ -3,13 +3,75 @@
 Sibling to flexdec.py for the p340 paging rig. Focus: alphanumeric pages only
 (the 7-bit-ASCII message type) -- numeric/tone pages are ignored.
 
-Why this can reuse flexdec: POCSAG and FLEX share the *identical* BCH(31,21)
-codeword (generator 0x769). The POCSAG frame-sync codeword 0x7CD215D8 and idle
-codeword 0x7A89C197 both verify with zero syndrome under flexdec.bch3121, and
-flexdec.bch3121_chase soft-decodes POCSAG words unchanged. english_score is
-reused for the alpha-readability gate.
+=============================================================================
+A PRIMER FOR THE READER WHO IS A SOFTWARE ENGINEER BUT NOT AN RF ENGINEER
+=============================================================================
+If you have never touched a radio, here is the whole journey a pager message
+takes and exactly where this file joins it. Everything below is "just signal
+processing on arrays of numbers" -- there is no analog magic hiding in here.
 
-Signal model (2-FSK NRZ):
+1. ENCODING THE BITS (done by the transmitter, far away).
+   To send bits over the air a transmitter uses FSK -- frequency-shift keying.
+   To send a 0 it nudges the carrier frequency one way; to send a 1 it nudges
+   it the other. POCSAG uses TWO frequencies (2-FSK), about +/-4.5 kHz around
+   the channel center (the DEVIATION constant). So "the data" is literally
+   encoded as "is the instantaneous frequency high or low right now?".
+
+2. WHAT THE RADIO HANDS US.
+   The SDR (software-defined radio) gives us a stream of complex numbers --
+   "I/Q samples" -- that represent the received signal as a rotating phasor
+   (a unit-ish vector spinning in the complex plane). The *speed* at which that
+   phasor rotates IS the instantaneous frequency. Our sample rate is 250 kHz,
+   so we get 250000 of these complex numbers per second.
+
+3. FM DEMODULATION (`fm_demod`): radio -> a 1-D wiggle.
+   To recover "high tone vs low tone" we measure how far the phasor rotated
+   between each adjacent pair of samples: angle(x[n] * conj(x[n-1])). A positive
+   angle means it spun one way (one tone), negative the other. This collapses
+   the 2-D complex stream into a 1-D real-valued signal -- the "demod" -- whose
+   sign carries the bit. (This is the same math an analog FM radio's
+   discriminator does; here it is two lines of numpy.)
+
+4. SYMBOL TIMING (`_decimate_to_osr` + the phase search in `decode_demod`).
+   The transmitter sends 1200 bits/second (the BAUD). At 250 kHz that is ~208
+   samples per bit -- far more than we need. We resample so each bit ("symbol")
+   spans exactly OSR=8 samples. But WHICH of those 8 samples best represents the
+   bit? The middle of the bit is cleanest (the open centre of the "eye
+   diagram"); the edges are where the signal is sliding between tones. Many
+   receivers run a feedback loop (Mueller & Muller, Gardner, ...) to lock onto
+   that centre. We do something simpler and just as good here because the frame
+   sync re-appears constantly: we try ALL 8 sampling phases (and both tone
+   polarities) and keep whichever one makes the known sync word appear most
+   often. See `decode_demod`. (Note: an earlier draft of this docstring claimed
+   Mueller&Muller recovery -- there is no M&M loop; the brute phase search
+   replaced it.)
+
+5. ERROR CORRECTION (`_decode_word` -> flexdec BCH + Chase).
+   The air is noisy, so POCSAG wraps every 32-bit codeword in a BCH(31,21)
+   error-correcting code (+1 parity bit) able to FIX up to 2 flipped bits per
+   word with no retransmission. Words that still fail get a second pass with
+   "Chase" soft-decision decoding, which uses our per-bit confidence to guess
+   which bits to flip. This is the single most important reason a weak page
+   still decodes cleanly.
+
+6. REASSEMBLY + SANITY GATE (`_scan_bits`, `_alpha_from_payloads`,
+   `is_clean_alpha`). The corrected codewords are stitched back into the
+   original 7-bit ASCII text, then screened so that FEC-manufactured nonsense
+   never reaches the log.
+
+=============================================================================
+WHY THIS FILE CAN REUSE flexdec
+=============================================================================
+POCSAG and FLEX share the *identical* BCH(31,21) codeword (generator 0x769).
+The POCSAG frame-sync codeword 0x7CD215D8 and idle codeword 0x7A89C197 both
+verify with zero syndrome under flexdec.bch3121, and flexdec.bch3121_chase
+soft-decodes POCSAG words unchanged. english_score is reused for the
+alpha-readability gate. That hard-won FEC + language code lives in one place;
+this file only adds the POCSAG-specific framing on top.
+
+=============================================================================
+THE WIRE FORMAT (2-FSK NRZ)
+=============================================================================
   preamble (>=576 alternating bits) -> [ FSC + 8 frames x 2 codewords ] repeated.
   A codeword is 32 bits, transmitted MSB first:
     bit31 (first sent) = flag : 0 = address codeword, 1 = message codeword
@@ -19,9 +81,17 @@ Signal model (2-FSK NRZ):
   Alpha text = payload bits of consecutive message codewords concatenated in
   transmission order, sliced into 7-bit chars LSB-first (first bit = char LSB).
 
+  The gotcha that bites everyone: POCSAG splits each batch into 8 numbered
+  "frames", and a given pager only listens in the one frame its address hashes
+  to (a power-saving trick -- the receiver can sleep the other 7/8 of the time).
+  The 18-bit address carried in the codeword therefore DROPS its low 3 bits;
+  those 3 bits are implied by WHICH frame slot the word arrived in. `_scan_bits`
+  rebuilds the full capcode as (addr18 << 3) | frame_index.
+
 Pipeline: complex baseband -> FM demod -> decimate to OSR samples/symbol ->
-DC-block -> Mueller&Muller timing recovery (1 soft sample/symbol) -> FSC-locked
-batch slicer -> per-codeword BCH (+Chase soft) -> alpha assembly -> english gate.
+DC-block -> best-of-8 sampling phase (chosen by FSC correlation, not an M&M
+loop) -> FSC-locked batch slicer -> per-codeword BCH (+Chase soft) ->
+alpha assembly -> english gate.
 """
 import sys
 import numpy as np
@@ -29,18 +99,30 @@ from scipy import signal
 
 import flexdec as F   # bch3121, bch3121_chase, english_score
 
+# ---------------------------------------------------------------------------
+# PROTOCOL CONSTANTS
+# ---------------------------------------------------------------------------
+# The Frame Sync Codeword (FSC) is a fixed 32-bit pattern the transmitter sends
+# at the start of every batch. It is the lighthouse we steer by: finding it in
+# the bit stream tells us both WHERE codewords begin and that our sampling/
+# polarity choices are correct. IDLE is the filler word sent in unused slots --
+# spotting it lets us close out a finished message. Both happen to be valid
+# BCH(31,21) codewords (zero syndrome), which is how flexdec's BCH validates them.
 FSC  = 0x7CD215D8     # frame sync codeword
 IDLE = 0x7A89C197     # idle codeword
-FSC_INV = FSC ^ 0xFFFFFFFF
+FSC_INV = FSC ^ 0xFFFFFFFF   # FSC with every bit flipped (the opposite polarity)
 
-IN_RATE_DEFAULT = 250000
-BAUD = 1200
-OSR  = 8              # samples/symbol after decimation (M&M interpolates within)
-DEVIATION = 4500.0    # POCSAG nominal +/-4.5 kHz
+IN_RATE_DEFAULT = 250000   # SDR sample rate we expect at the input (Hz)
+BAUD = 1200                # POCSAG-1200: 1200 bits (symbols) per second
+# OSR = "oversampling ratio" = samples per symbol AFTER `_decimate_to_osr`.
+# We deliberately keep 8 samples per bit (not 1) so the phase search in
+# `decode_demod` has 8 candidate sampling instants to choose the eye-centre from.
+OSR  = 8
+DEVIATION = 4500.0    # FSK tone offset from center: POCSAG nominal +/-4.5 kHz
 
-CW_BITS = 32
-BATCH_CWS = 16        # 8 frames x 2 codewords
-PREAMBLE_MIN = 0      # we lock on FSC directly, preamble only aids the DPLL
+CW_BITS = 32          # every POCSAG codeword is 32 bits
+BATCH_CWS = 16        # a batch = 8 frames x 2 codewords = 16 codewords after the FSC
+PREAMBLE_MIN = 0      # we lock on the FSC directly; the preamble only helps timing
 
 EN_FLOOR_DEFAULT = 0.45   # english_score gate; lowest real SNO911 page = 0.49
 ALPHA_MIN_LEN = 12        # real dispatches run 34+ chars. Sub-12 readable
@@ -63,13 +145,33 @@ def is_clean_alpha(text, en_floor=EN_FLOOR_DEFAULT):
     return F.english_score(text) >= en_floor
 
 
+# ---------------------------------------------------------------------------
+# DSP FRONT-END: complex radio samples -> a clean 1-D symbol stream
+# ---------------------------------------------------------------------------
+# These three functions are the entire "analog" half of the decoder. After them
+# we are working with a plain real-valued array where the SIGN of each sample is
+# the received bit. Everything downstream is bit-twiddling and error correction.
+
 def fm_demod(x):
-    """Instantaneous frequency (rad/sample) of complex baseband."""
+    """FM-demodulate complex baseband -> instantaneous frequency (rad/sample).
+
+    The product x[n] * conj(x[n-1]) is a complex number whose ANGLE is exactly
+    how far the received phasor rotated in one sample step. Rotation rate is
+    frequency, and POCSAG put the data in the frequency (2-FSK), so this angle
+    sequence IS the demodulated signal: positive = one tone, negative = the
+    other. Two lines of numpy replace what an analog radio does with a
+    discriminator circuit. Output is one shorter than the input (we need pairs)."""
     return np.angle(x[1:] * np.conj(x[:-1])).astype(np.float64)
 
 
 def _decimate_to_osr(d, in_rate):
-    """Resample the demod to exactly OSR*BAUD samples/s (integer OSR/symbol)."""
+    """Resample the demod so each symbol is EXACTLY OSR samples wide.
+
+    The input arrives at `in_rate` (e.g. 250 kHz) but a symbol is 1/BAUD seconds
+    long, so symbols start at non-integer sample positions -- awkward to slice.
+    We rationally resample to OSR*BAUD = 9600 samples/s, after which every symbol
+    is precisely OSR=8 samples and symbol k starts at sample 8*k. resample_poly
+    needs an integer up/down ratio, so we divide both by their GCD."""
     target = OSR * BAUD                         # 9600 for OSR=8, BAUD=1200
     g = np.gcd(int(round(in_rate)), target)
     up, down = target // g, int(round(in_rate)) // g
@@ -77,9 +179,15 @@ def _decimate_to_osr(d, in_rate):
 
 
 def _dc_block(y, span_syms=32):
-    """Remove slow frequency offset: subtract a moving average ~span_syms long.
-    POCSAG preamble/data is DC-balanced over a few symbols, so this centres the
-    eye without touching symbol transitions."""
+    """Remove slow frequency offset so the decision boundary sits at zero.
+
+    Problem: the transmitter's centre frequency and our SDR's tuner never match
+    perfectly, so the whole demod sits shifted up or down by a slowly-drifting
+    offset (a DC bias). If we sliced bits at exactly 0 with a nonzero bias, every
+    bit could read the same. Fix: estimate that bias as a moving average ~32
+    symbols long and subtract it, re-centring the signal on zero. POCSAG data is
+    DC-balanced over a few symbols (roughly as many 0s as 1s), so the moving
+    average tracks the offset, not the data, and symbol transitions survive."""
     n = int(span_syms * OSR)
     if n < 3 or n >= len(y):
         return y - np.mean(y)
@@ -88,8 +196,16 @@ def _dc_block(y, span_syms=32):
     return y - base
 
 
+# ---------------------------------------------------------------------------
+# BIT / CODEWORD UTILITIES + ERROR CORRECTION
+# ---------------------------------------------------------------------------
+
 def _word_at(bits, n):
-    """Pack 32 bits (MSB first) starting at index n into an int."""
+    """Pack the 32 bits starting at index n into one int, MSB first.
+
+    POCSAG sends each codeword most-significant-bit first, so bits[n] is bit 31
+    of the resulting word and bits[n+31] is bit 0. We just shift-and-or them in
+    order, which naturally lands the first-received bit in the top position."""
     w = 0
     for i in range(CW_BITS):
         w = (w << 1) | int(bits[n + i])
@@ -97,11 +213,21 @@ def _word_at(bits, n):
 
 
 def _hamming32(a, b):
+    """Hamming distance: how many of the 32 bit positions differ between a and b.
+    XOR sets a 1 wherever they disagree; popcount counts those 1s. Used to ask
+    'is this received word close enough to the FSC to call it a sync?'."""
     return bin((a ^ b) & 0xFFFFFFFF).count("1")
 
 
 def _decode_word(w, mag32, chase=True):
-    """Return (corrected_word, ok). Uses hard BCH then Chase-II soft fallback."""
+    """Error-correct one received codeword. Returns (corrected_word, ok).
+
+    Two-stage, cheapest-first: try HARD BCH decoding (fixes <=2 bit errors from
+    the bit pattern alone, very fast). If that fails and we have per-bit
+    reliabilities (mag32), fall back to CHASE soft-decision decoding, which is
+    allowed to fix more errors by trusting that the lowest-confidence bits are
+    the likely culprits. `ok` is False only if both give up -- a genuinely
+    corrupted word we must drop. (Both routines are flexdec's, reused verbatim.)"""
     cw, nerr = F.bch3121(w)
     if nerr >= 0:
         return cw, True
@@ -113,7 +239,15 @@ def _decode_word(w, mag32, chase=True):
 
 
 def _alpha_from_payloads(payload_bits):
-    """payload_bits: list of message-bit ints (0/1) in transmission order.
+    """Reassemble the 7-bit ASCII message text from a run of payload bits.
+
+    Each message codeword contributed 20 payload bits (added MSB-first by
+    _scan_bits). Concatenated across codewords, those bits form a continuous
+    stream that POCSAG packs as 7-bit characters, LEAST-significant bit first.
+    So we fill an accumulator low-bit-first, emit a char every 7 bits, and skip
+    the NUL/EOT codes used purely as end-of-message padding.
+
+    payload_bits: list of message-bit ints (0/1) in transmission order.
     7-bit chars, LSB first (first bit = char LSB)."""
     chars = bytearray()
     acc = 0
@@ -130,18 +264,30 @@ def _alpha_from_payloads(payload_bits):
     return bytes(chars)
 
 
+# ---------------------------------------------------------------------------
+# SYNCHRONISATION + DECODE
+# ---------------------------------------------------------------------------
+# FSC as a +/-1 vector (bit 1 -> +1, bit 0 -> -1), precomputed once. Correlating
+# a slice of the bit stream against this is just a dot product, and that dot
+# product peaks when the slice equals the FSC -- the basis of both timing
+# selection (_fsc_score) and batch locking (_scan_bits).
 _FSC_PM = np.array([1.0 if (FSC >> (CW_BITS - 1 - i)) & 1 else -1.0
                     for i in range(CW_BITS)], dtype=np.float32)
 
 
 def _fsc_score(bits):
-    """Count near-exact FSC codeword matches in a bit stream (sampling-quality
-    proxy). The phase whose sample instant sits in the centre of the eye yields
-    the most low-error FSC words, so this picks the optimal timing without an
-    M&M loop. Vectorized as a +/-1 cross-correlation with the FSC pattern: a
-    32-bit window scores CW_BITS minus twice its Hamming distance to FSC, so
-    >= CW_BITS-4 counts every <=2-bit match (the same threshold _scan_bits uses
-    to lock)."""
+    """Count near-exact FSC matches in a bit stream -- our timing-quality score.
+
+    The idea: of the OSR=8 candidate sampling phases, the one that lands in the
+    open centre of the eye produces the fewest bit errors, so the known sync word
+    shows up most often. We therefore RANK phases by 'how many clean FSCs does
+    this phase produce', and `decode_demod` keeps the winner. No feedback loop
+    needed because the sync word recurs every batch.
+
+    Vectorised trick: map bits to +/-1 and cross-correlate with the FSC pattern.
+    A 32-bit window's correlation equals CW_BITS minus twice its Hamming distance
+    to the FSC, so a correlation >= CW_BITS-4 is exactly a <=2-bit match -- the
+    same 2-error tolerance _scan_bits uses when it locks onto a real batch."""
     if len(bits) < CW_BITS:
         return 0
     pm = bits.astype(np.float32) * 2.0 - 1.0
@@ -150,12 +296,17 @@ def _fsc_score(bits):
 
 
 def decode_demod(y, on_page=None):
-    """Decode an oversampled (OSR samples/symbol) DC-blocked demod into alpha
-    pages. The resampler already locks to exactly OSR samples/symbol and the FSC
-    re-syncs every batch, so instead of an M&M loop we score every sampling phase
-    and both FSK polarities by exact-FSC count, then decode only the best one
-    (the centred eye gives the fewest bit errors). Returns list of
-    (address, function, text_bytes)."""
+    """Decode an oversampled, DC-blocked demod into alpha pages.
+
+    This is where 'symbol timing recovery' happens, the cheap way. Two unknowns:
+    (a) which of the OSR sampling phases is the eye centre, and (b) the FSK
+    POLARITY -- whether a positive demod means bit 1 or bit 0, which depends on
+    whether the SDR tuned above or below the carrier and can flip per capture.
+    We brute-force both: for each phase take every OSR-th sample, try it and its
+    negation, score each with _fsc_score, and keep the (phase, polarity) pair
+    that yields the most clean sync words. Then decode that one stream. Cheaper
+    and more robust than a tracking loop because the FSC re-syncs every batch.
+    Returns list of (address, function, text_bytes, sym_pos)."""
     best_soft = None
     best_hits = -1
     for phase in range(OSR):
@@ -176,7 +327,23 @@ def decode_demod(y, on_page=None):
 
 
 def _scan_bits(bits, soft):
-    """Find FSC-locked batches, decode codewords, assemble alpha messages.
+    """Walk the bit stream, lock onto each batch via the FSC, and parse pages.
+
+    This is the protocol state machine. We slide one bit at a time looking for a
+    word within 2 errors of the FSC; once found, the 16 codewords of that batch
+    sit immediately after it at fixed 32-bit spacing, so we decode them in place
+    (no further searching) and jump past the whole batch. Within a batch:
+      * an ADDRESS codeword (flag bit = 0) starts a new page -- we flush whatever
+        message was in progress, then rebuild the full capcode by appending the
+        frame number (the codeword's slot, 0..7) to the 18-bit address, because
+        POCSAG drops those 3 low bits (see the wire-format note up top);
+      * a MESSAGE codeword (flag bit = 1) contributes 20 payload bits to the
+        current page;
+      * an IDLE word flushes the current page (end of message).
+
+    `soft` (the signed pre-slice samples) gives Chase its per-bit confidence:
+    |soft| is large where the symbol sat far from the decision boundary.
+
     Returns (address, function, text, sym_pos) where sym_pos is the symbol index
     of the page's address codeword -- used by POCSAGStream to dedup the same
     physical page seen in two overlapping windows."""
@@ -239,14 +406,39 @@ def _scan_bits(bits, soft):
     return pages
 
 
+# ---------------------------------------------------------------------------
+# TOP-LEVEL ENTRY POINTS
+# ---------------------------------------------------------------------------
+
 def decode_baseband(x, in_rate=IN_RATE_DEFAULT, on_page=None):
-    """Full pipeline from complex baseband to alpha pages.
+    """Full pipeline from complex baseband to alpha pages -- the four front-end
+    steps from the primer, in order: FM demod -> resample to OSR/symbol ->
+    DC-block -> phase-search + frame parse.
     Returns list of (address, function, text, sym_pos)."""
     d = fm_demod(x)
     y = _decimate_to_osr(d, in_rate)
     y = _dc_block(y)
     return decode_demod(y, on_page=on_page)
 
+
+# ---------------------------------------------------------------------------
+# STREAMING WRAPPER (for the live receiver)
+# ---------------------------------------------------------------------------
+# Offline we decode a whole file at once. Live, samples arrive forever in small
+# chunks and we must emit each page EXACTLY ONCE the moment we have enough of it.
+# The classic hazard: if we just decoded back-to-back fixed blocks, a page that
+# straddled a block boundary would be cut in half and lost. The fix is the
+# "overlap-save" pattern, borrowed from block convolution:
+#   * keep a sliding WINDOW of samples and decode it whole;
+#   * after each decode, advance by less than a window (ADVANCE < WINDOW), so
+#     consecutive windows OVERLAP by (window - advance) seconds;
+#   * only EMIT pages whose address codeword began within the first `advance`
+#     seconds of the window. A page emitted there still has the full overlap
+#     region after it to hold its (bounded-length) message, so it is never
+#     truncated; and because every page is emitted by exactly one window's
+#     emit-region, we get each page once with no de-dup bookkeeping.
+# The overlap just needs to exceed the longest possible transmission. This is
+# the POCSAG analogue of flexdec_stream.StreamDecoder.
 
 class POCSAGStream:
     """Feed complex baseband (one carrier @ in_rate, default 250k) in arbitrary

@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
-"""Multiprocessing variant of flex_inmem: one OS PROCESS per carrier instead of
-one thread, so each carrier's StreamDecoder runs under its own GIL and the
-per-carrier decode work parallelizes across cores for real.
+"""Live FLEX receiver: SDR -> per-carrier channel-select -> one OS process per
+carrier running a StreamDecoder. Decodes many FLEX carriers concurrently in real
+time, with no intermediate audio file between the SDR and the decoder.
 
-Why: the threaded flex_inmem.py serializes on the shared GIL. Five carriers'
-worth of decode is only ~2.7 cores of actual work (profiled ~0.54x realtime per
-carrier), but the Python glue around the njit/numpy hot kernels holds the GIL,
-so the worker threads can't use >1 core concurrently and 4/5 carriers starve.
-Giving each carrier its own process sidesteps the GIL entirely. GNU Radio's
-flowgraph stays in the parent (native C++); complex64 baseband chunks cross to
-the worker processes via an mp.Queue (drop-oldest on overflow -- same contract
-as the threaded ring, so a slow decode never back-pressures the SDR).
+Each carrier owns its own process (own GIL), so the per-carrier matched-filter
+bank + Chase-II decode parallelizes across cores: GNU Radio's flowgraph stays in
+the parent, and complex64 baseband chunks cross to the worker processes via an
+mp.Queue (drop-oldest on overflow, so a slow decode never back-pressures the SDR).
+The StreamDecoder (in flex_core) re-runs the validated batch decode on overlapping
+windows and de-duplicates by frame slot, so the live output matches batch exactly.
 
-Modes mirror flex_inmem.py:
-  --file CFILE [--in-rate HZ]   single-carrier parity check (unbounded queue)
-  --live [FIFO_DIR]             live RSPdx, all active carriers, one proc each
+Modes:
+  --live --carriers MHz,MHz,... [--center MHz] [FIFO_DIR]
+                                live SDR, one process per carrier. Carrier
+                                frequencies are given in MHz; the tuner center
+                                defaults to their midpoint.
+  --file CFILE [--in-rate HZ]   replay a recorded capture through the same path
+                                (a single-carrier parity check vs the batch decoder)
+
+See docs/receiver.md for the architecture.
 """
 import argparse
 import os
@@ -28,16 +32,19 @@ from gnuradio import gr, blocks, filter, soapy
 from gnuradio.filter import firdes
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-# flexdec_stream sits beside this file (online/); shared core at the repo root.
-# In the flat /usr/local/bin install everything is co-located -- cover both.
-sys.path.insert(0, os.path.dirname(_HERE))
+# Shared decode core lives in core/; the flat /usr/local/bin install co-locates
+# everything -- cover both layouts.
+sys.path.insert(0, os.path.join(_HERE, "core"))
 sys.path.insert(0, _HERE)
-import flexdec_stream as S
-import flexdec as F
-# Single source of truth for the SDR/carrier constants -- reuse the threaded
-# module's values so the two paths can never drift in a benchmark.
-from flex_inmem import (CENTER, SAMP_RATE, DECIM, IN_RATE,
-                        WINDOW_FR, ADVANCE_FR, CARRIERS, LOG_DIR)
+import flex_core as F
+
+SAMP_RATE  = 2_500_000                    # /10 -> 250000 == flex_core.SAMP: no resample_poly
+DECIM      = 10
+IN_RATE    = SAMP_RATE // DECIM           # 250000 Hz complex baseband (== F.SAMP)
+WINDOW_FR  = 32                           # see StreamDecoder: >=16 reproduces batch
+ADVANCE_FR = 28                           # 4-frame edge margin, ~0.54x realtime/carrier
+
+LOG_DIR = "/var/log/flex"
 
 
 class RingSink(gr.sync_block):
@@ -91,7 +98,7 @@ def worker_proc(carrier, q, in_rate, window, advance, log_path, pages_val):
                 .replace("\r", "\\r").replace("\t", "\\t"))
         lf.write("%s FLEX|%d|%d|%s|0|ALN|%s\n" % (ts, carrier, slot, tier, text))
 
-    sd = S.StreamDecoder(cfg=dict(in_rate=in_rate),
+    sd = F.StreamDecoder(cfg=dict(in_rate=in_rate),
                          window_frames=window, advance_frames=advance,
                          on_page=on_page)
 
@@ -131,7 +138,7 @@ class FileGraph(gr.top_block):
     """file_source -> RingSink for the single-carrier parity check."""
 
     def __init__(self, cfile, q):
-        gr.top_block.__init__(self, "flex_inmem_mp_file")
+        gr.top_block.__init__(self, "flex_receiver_file")
         self.src = blocks.file_source(gr.sizeof_gr_complex, cfile, False)
         self.ring = RingSink("file", q)
         self.connect(self.src, self.ring)
@@ -140,11 +147,11 @@ class FileGraph(gr.top_block):
 class LiveGraph(gr.top_block):
     """SoapySDR RSPdx -> per-carrier freq_xlate -> RingSink (one mp.Queue each)."""
 
-    def __init__(self, queues, driver="sdrplay"):
-        gr.top_block.__init__(self, "flex_inmem_mp_live")
+    def __init__(self, queues, carriers, center, driver="sdrplay"):
+        gr.top_block.__init__(self, "flex_receiver_live")
         self.src = soapy.source(f"driver={driver}", "fc32", 1, "", "", [""], [""])
         self.src.set_sample_rate(0, SAMP_RATE)
-        self.src.set_frequency(0, CENTER)
+        self.src.set_frequency(0, center)
         self.src.set_gain_mode(0, False)
         self.src.set_gain(0, "RFGR", 4)
         self.src.set_gain(0, "IFGR", 25)
@@ -157,8 +164,8 @@ class LiveGraph(gr.top_block):
         taps = firdes.low_pass(1.0, SAMP_RATE, 9000, 60000)
         self.rings = {}
         self._blocks = []
-        for carrier in CARRIERS:
-            offset = carrier - CENTER
+        for carrier in carriers:
+            offset = carrier - center
             xlate = filter.freq_xlating_fir_filter_ccc(DECIM, taps, offset, SAMP_RATE)
             ring = RingSink(carrier, queues[carrier])
             self.connect(self.src, xlate, ring)
@@ -204,13 +211,13 @@ def run_file(cfile, in_rate):
 QUEUE_MAXCHUNKS = 1024
 
 
-def run_live(fifo_dir, driver="sdrplay"):
+def run_live(fifo_dir, carriers, center, driver="sdrplay"):
     os.makedirs(LOG_DIR, exist_ok=True)
-    queues = {c: mp.Queue(maxsize=QUEUE_MAXCHUNKS) for c in CARRIERS}
-    pages = {c: mp.Value('i', 0) for c in CARRIERS}
+    queues = {c: mp.Queue(maxsize=QUEUE_MAXCHUNKS) for c in carriers}
+    pages = {c: mp.Value('i', 0) for c in carriers}
 
     procs = {}
-    for carrier in CARRIERS:
+    for carrier in carriers:
         p = mp.Process(target=worker_proc,
                        args=(carrier, queues[carrier], IN_RATE, WINDOW_FR,
                              ADVANCE_FR, f"{LOG_DIR}/{carrier}.flexdec.log",
@@ -219,9 +226,9 @@ def run_live(fifo_dir, driver="sdrplay"):
         p.start()
         procs[carrier] = p
 
-    tb = LiveGraph(queues, driver=driver)
-    print(f"flex_inmem_mp LIVE: {driver} @ {CENTER/1e6:.4f} MHz, {SAMP_RATE} S/s -> "
-          f"{len(CARRIERS)} carriers @ {IN_RATE} Hz -> StreamDecoder PROCESSES "
+    tb = LiveGraph(queues, carriers, center, driver=driver)
+    print(f"flex_receiver LIVE: {driver} @ {center/1e6:.4f} MHz, {SAMP_RATE} S/s -> "
+          f"{len(carriers)} carriers @ {IN_RATE} Hz -> StreamDecoder PROCESSES "
           f"(window={WINDOW_FR} advance={ADVANCE_FR}) numba={F._HAVE_NUMBA} "
           f"resample={'OFF' if IN_RATE == F.SAMP else 'ON'}",
           file=sys.stderr, flush=True)
@@ -229,8 +236,8 @@ def run_live(fifo_dir, driver="sdrplay"):
     try:
         while True:
             time.sleep(30)
-            drops = {c: tb.rings[c].dropped_chunks for c in CARRIERS}
-            pgs = {c: pages[c].value for c in CARRIERS}
+            drops = {c: tb.rings[c].dropped_chunks for c in carriers}
+            pgs = {c: pages[c].value for c in carriers}
             print(f"[inmem-mp] pages={pgs} dropped={drops}", file=sys.stderr, flush=True)
     except KeyboardInterrupt:
         tb.stop(); tb.wait()
@@ -240,11 +247,28 @@ def run_live(fifo_dir, driver="sdrplay"):
             p.join(timeout=5)
 
 
+def _parse_carriers(spec):
+    """'929.6125,931.2125' (MHz) -> [929612500, 931212500] (Hz)."""
+    out = []
+    for tok in spec.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        out.append(int(round(float(tok) * 1e6)))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--file")
     ap.add_argument("--in-rate", type=float, default=float(F.SAMP))
     ap.add_argument("--live", action="store_true")
+    ap.add_argument("--carriers",
+                    help="comma-separated FLEX carrier frequencies in MHz for "
+                         "--live, e.g. 929.6125,929.9375,931.2125")
+    ap.add_argument("--center", type=float,
+                    help="SDR tuner center frequency in MHz; defaults to the "
+                         "midpoint of --carriers")
     ap.add_argument("--driver", default="sdrplay",
                     help="SoapySDR driver for --live (sdrplay|rtlsdr|airspy)")
     ap.add_argument("fifo_dir", nargs="?", default="/tmp/flex")
@@ -252,7 +276,20 @@ def main():
     if args.file:
         run_file(args.file, args.in_rate)
     elif args.live:
-        run_live(args.fifo_dir, driver=args.driver)
+        if not args.carriers:
+            ap.error("--live requires --carriers (comma-separated MHz)")
+        carriers = _parse_carriers(args.carriers)
+        if not carriers:
+            ap.error("--carriers parsed to an empty list")
+        center = (int(round(args.center * 1e6)) if args.center is not None
+                  else (min(carriers) + max(carriers)) // 2)
+        half = SAMP_RATE // 2
+        out_of_band = [c for c in carriers if abs(c - center) > half]
+        if out_of_band:
+            ap.error(f"carriers outside the {SAMP_RATE/1e6:.1f} MHz capture window "
+                     f"around {center/1e6:.4f} MHz: "
+                     f"{[c/1e6 for c in out_of_band]} MHz")
+        run_live(args.fifo_dir, carriers, center, driver=args.driver)
     else:
         ap.error("specify --file CFILE or --live")
 

@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
-"""From-scratch FLEX decoder (numpy/scipy), built from the TIA-1500 protocol
-tables in gr-pager. Front-end + faithful sign-based sync state machine, but with
-a *switchable* 4-level slicer so we can A/B the legacy fixed-threshold approach
-against per-frame adaptive level estimation and BCH-gated output.
+"""From-scratch FLEX decoder CORE (numpy/scipy), built from the TIA-1500 protocol
+tables in gr-pager. Front-end + faithful sign-based sync state machine, a 4-FSK
+matched-filter detector, BCH-gated output, and confidence tiering.
 
-Usage: flexdec.py <cfile> [slicer] [--diag]
-  slicer = fixed | perframe   (default perframe)
+This module is the importable library: constants + decode functions + FlexSync +
+the live `StreamDecoder` wrapper (at the bottom of this file). Pure numpy/scipy,
+no GNU Radio. The batch CLI (`flex_batch.py`) and the SDR receiver
+(`flex_receiver.py`) both build on it.
 
 =============================================================================
 A PRIMER FOR THE READER WHO IS A SOFTWARE ENGINEER BUT NOT AN RF ENGINEER
 =============================================================================
 FLEX is the Motorola paging protocol (spec TIA-1500) that carries the messages
 on the 929-932 MHz pager band. This decoder turns a recording of raw radio
-samples into the text of those pages, in pure numpy/scipy. If pocsagdec.py is
+samples into the text of those pages, in pure numpy/scipy. If pocsag_core.py is
 the gentle introduction, this is the graduate course -- FLEX is markedly harder
 than POCSAG, and most of the cleverness here exists to claw real pages out of
-WEAK, fading carriers. Read pocsagdec.py's primer first; the radio fundamentals
+WEAK, fading carriers. Read pocsag_core.py's primer first; the radio fundamentals
 (FSK, I/Q samples, FM demodulation, symbol timing, BCH error correction) are
 explained there and assumed here.
 
@@ -49,19 +50,19 @@ What makes FLEX harder than POCSAG:
    import it), plus optional Chase soft-decision decoding for words that fail
    hard decode.
 
-THE DETECTOR HAS THREE "TIERS" (selectable; we A/B them honestly):
-  * The default FM-DISCRIMINATOR path: FM-demodulate to a 1-D wiggle, then slice
-    its amplitude into 4 levels. Simple and robust; what gr-pager / multimon do.
-  * Tier 1, the MATCHED-FILTER BANK (mf_bank_mag, --mfbank): instead of
-    demodulating, correlate the complex signal against each of the 4 expected
-    tones over each symbol and pick the strongest. This is the textbook OPTIMAL
-    noncoherent detector for orthogonal FSK and squeezes out marginally weaker
-    pages.
-  * Tier 2, a per-frame CARRIER-OFFSET NULL (est_cfo): re-centre each frame's
-    tones to cancel residual tuning error.
-  * Tier 3, COHERENT detection (coherent_metric, --coh): track the carrier phase
-    and exploit it. EMPIRICALLY THIS LOSES for FLEX (documented at length in
-    coherent_metric) -- kept only as an instructive dead-end.
+THE DETECTOR:
+  * The MATCHED-FILTER BANK (mf_bank_mag): rather than FM-demodulating to a 1-D
+    wiggle and slicing it (what gr-pager / multimon do), correlate the complex
+    signal against each of the 4 expected tones over each symbol and pick the
+    strongest. This is the textbook OPTIMAL noncoherent detector for orthogonal
+    FSK and squeezes out marginally weaker pages.
+  * A per-frame CARRIER-OFFSET NULL (est_cfo) re-centres each frame's tones to
+    cancel residual tuning error before the bank runs.
+
+(Coherent per-symbol phase tracking was tried and abandoned: FLEX is integer-h
+CPFSK with exactly-orthogonal tones, the regime where coherent's edge over
+noncoherent is smallest and the phase-tracking burden under fading is highest, so
+it lost outright. Noncoherent detection is why pagers use FSK in the first place.)
 
 ACQUISITION (finding frames) has two strategies:
   * FlexSync: a faithful port of the classic shift-register sync state machine
@@ -80,6 +81,7 @@ together behind command-line flags so we can A/B any combination against a
 frozen capture. The live receivers import the building blocks directly.
 """
 import sys
+import re
 from math import gcd
 import numpy as np
 from scipy import signal
@@ -121,7 +123,7 @@ FRAME_PERIOD = 30000             # exact FLEX frame length: 1.875 s @ 16 kHz
 
 # ---- shared core (BCH FEC + readability) ----------------------------------
 # popcount, the BCH(31,21) FEC + Chase soft-decoder, and the english_score
-# readability gate are protocol-neutral and shared with pocsagdec.py, so they
+# readability gate are protocol-neutral and shared with pocsag_core.py, so they
 # live in paging_core.py (see that module's header). _REV8/reverse_bits32 below
 # are the FLEX-specific 21-bit word unmask and stay here.
 from paging_core import (popcount, BCH_N, BCH_K, _BCH_TBL,
@@ -134,7 +136,7 @@ def reverse_bits32(v):
            (_REV8[(v >> 16) & 0xFF] << 8) | (_REV8[(v >> 24) & 0xFF])
 
 # Dense array form of the syndrome->error table for the njit hot-path core
-# (flexdec_numba). BCH syndrome is 11 bits; 0 = no correctable error (a valid
+# (flex_numba). BCH syndrome is 11 bits; 0 = no correctable error (a valid
 # 1/2-bit pattern is nonzero, and a nonzero syndrome never arises from no-error,
 # so 0 is an unambiguous miss). Falls back to pure Python if numba is missing.
 _BCH_ARR = np.zeros(1 << (BCH_N - BCH_K + 1), dtype=np.int64)
@@ -144,7 +146,7 @@ _REV8_ARR = np.array(_REV8, dtype=np.int64)
 try:
     import os as _os
     sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
-    from flexdec_numba import deint_decode_core as _deint_core
+    from flex_numba import deint_decode_core as _deint_core
     _HAVE_NUMBA = True
 except Exception:
     _HAVE_NUMBA = False
@@ -211,15 +213,13 @@ def est_cfo(xb, c0, c1):
     seg = xb[c0:c1]
     return float(np.angle(np.sum(seg[1:] * np.conj(seg[:-1]))) * SAMP / (2 * np.pi))
 
-def mf_bank_mag(xb, pos16, baud, cfo=0.0, inv=False, complex_out=False):
-    """Noncoherent 4-FSK matched-filter bank (Tier 1). For each symbol center
+def mf_bank_mag(xb, pos16, baud, cfo=0.0, inv=False):
+    """Noncoherent 4-FSK matched-filter bank. For each symbol center
     (in 16 kHz sample units), correlate the 250 kHz complex baseband against
     each of the 4 FLEX tones over one symbol period; return |correlation|
     (nsym,4). This is the optimal noncoherent detector: FLEX's tone spacing
     (3200 Hz) equals the baud rate, so the tones are orthogonal over a symbol.
-    `cfo` (Hz, Tier 2) shifts the reference tones to null residual carrier.
-    `complex_out` returns the raw complex correlations instead of |.| (the phase
-    is the carrier phase at the symbol center -- used by the coherent detector).
+    `cfo` (Hz) shifts the reference tones to null residual carrier.
 
     Implementation: the reference phase factorizes. For symbol s, lag l the
     per-sample offset is rel[s,l] = frac[s] + lrel[l], where lrel[l] = l-half is
@@ -248,61 +248,7 @@ def mf_bank_mag(xb, pos16, baud, cfo=0.0, inv=False, complex_out=False):
         segc = seg[clipped]
         for k, f in enumerate(tones):
             c[clipped, k] = np.sum(segc * np.exp(-1j * 2 * np.pi * f / SAMP * rel), axis=1)
-    return c.astype(np.complex128) if complex_out else np.abs(c)
-
-def coherent_metric(C, baud, inv=False, alpha=0.05):
-    """Tier 3: coherent CPFSK per-symbol phase tracking via a SQUARING loop.
-
-    *** EMPIRICAL VERDICT (2026-05-30): coherent detection LOSES here. ***
-    A/B on the 33 synced anchors: noncoherent |C| = 1942 BCH fails / 14 clean pages;
-    every coherent variant tried (decision-directed, squaring, squaring+unwrap) =
-    ~7800 fails / 1 clean. Reason is fundamental, not a bug: FLEX is integer-h CPFSK
-    (tones at odd multiples of pi/symbol -> exactly orthogonal), the regime where
-    coherent's edge over noncoherent is smallest (~1 dB) and the phase-tracking
-    burden is highest. With ~18% symbol errors on faded frames the carrier-phase
-    estimate is built from wrong-tone/weak correlations, so de-rotation flips bits
-    instead of cleaning them. This is precisely why pagers use noncoherent FSK. Kept
-    as a documented opt-in (--coh) dead-end; the noncoherent MF bank stays default.
-
-    The per-frame CFO null (Tier 2) removes the mean carrier; this tracks the
-    residual *carrier phase* symbol-by-symbol and replaces the noncoherent |C|
-    with the coherent statistic Re(C * e^{-j*expected_phase}).
-
-    Why squaring (and why the first, decision-directed attempt failed): FLEX
-    mode-3 tones (+-4800/+-1600 Hz) at 3200 baud advance the signal phase by
-    2*pi*f/baud = {+-3pi,+-pi} per symbol -- all ODD multiples of pi. A
-    decision-directed loop must subtract the decided tone's half-symbol phase,
-    which differs by pi between tones, so one wrong decision under fading shifts
-    the tracked carrier by pi and the loop LATCHES to the wrong branch, globally
-    flipping bits (measured: 1942 -> 7772 BCH fails). Squaring sidesteps this:
-    the true-tone center-correlation phase is carrier + (n%2)*pi + dphi_k/2, so
-    angle(C^2) = 2*carrier + pi for EVERY tone -- completely data-independent. We
-    track 2*carrier with a zero-lag forward-backward smoother on the unit phasor
-    (bounded, no runaway), halve it, and de-rotate each tone by its exact
-    deterministic expected phase. The halving leaves a global +-1 sign on R (the
-    carrier-mod-pi ambiguity), resolved downstream by decoding both signs and
-    keeping the lower BCH-fail count. Returns R (nsym,4) coherent MF outputs."""
-    tones = (FLEX_TONES[::-1] if inv else FLEX_TONES)
-    dphi = 2 * np.pi * tones / baud          # exact per-symbol phase advance per tone
-    nsym = C.shape[0]
-    if nsym == 0:
-        return np.zeros((0, 4))
-    win = np.argmax(np.abs(C), axis=1)       # noncoherent winner (decision used ONLY here)
-    cw = C[np.arange(nsym), win]
-    sq = -(cw * cw)                          # angle = 2*carrier (the +pi removed by -1)
-    s = sq / np.maximum(np.abs(sq), 1e-12)   # unit phasor; track on the circle (no unwrap)
-    f = np.empty(nsym, complex); acc = s[0]
-    for n in range(nsym):                    # causal EMA
-        acc = (1 - alpha) * acc + alpha * s[n]; f[n] = acc
-    b = np.empty(nsym, complex); acc = s[-1]
-    for n in range(nsym - 1, -1, -1):        # anti-causal EMA -> zero net lag
-        acc = (1 - alpha) * acc + alpha * s[n]; b[n] = acc
-    theta = 0.5 * np.unwrap(np.angle(f + b)) # carrier estimate (unwrap 2*carrier, then halve)
-    nmod = (np.arange(nsym) % 2) * np.pi     # deterministic cumulative data phase at center
-    R = np.empty((nsym, 4))
-    for k in range(4):
-        R[:, k] = (C[:, k] * np.exp(-1j * (theta + nmod + dphi[k] / 2.0))).real
-    return R
+    return np.abs(c)
 
 # --- 4 levels -> 2 bits, with confidence -----------------------------------
 # A 4-level symbol carries 2 bits. FLEX uses a Gray-style map so that the two
@@ -341,10 +287,10 @@ def demux_phases(bit_a, bit_b, mag_a, mag_b, baud):
 # levels actually sit. The textbook assumption (symmetric levels at +/-2, +/-6)
 # is wrong in practice: tuning offset, filter group delay and FM-discriminator
 # nonlinearity make the real four-level constellation asymmetric and drifting.
-# So instead of fixed thresholds we LEARN the level centres from the data with
-# tiny 1-D k-means: two_means finds the inner/outer split for 2-level decisions,
-# kmeans4 finds all four centres for full 4-level slicing. This is the single
-# biggest accuracy win over the legacy fixed-threshold slicer.
+# So instead of fixed thresholds the decoder LEARNS the level centres from the
+# data with tiny 1-D k-means: two_means finds the inner/outer split for 2-level
+# decisions, kmeans4 finds all four centres for full 4-level slicing. This
+# adaptive slicing is substantially more accurate than fixed thresholds.
 def two_means(mags, it=20):
     """1-D 2-means on magnitudes -> (low_center, high_center)."""
     lo, hi = np.percentile(mags, 25), np.percentile(mags, 75)
@@ -948,157 +894,127 @@ def add_comb_frames(frames, total_len, verbose=False):
               f"(of ~{kmax-kmin+1} possible, kmin={kmin})")
     return out
 
-# ---- driver ---------------------------------------------------------------
-# RESEARCH HARNESS, not the production entry point. main() wires every option
-# above behind command-line flags so we can A/B any combination (FM-disc vs
-# matched-filter bank, hard-sync vs correlator vs comb, fixed vs adaptive slicer,
-# Chase on/off, coherent on/off) against a frozen capture and compare decode
-# counts. The live receivers (flex_inmem_mp.py etc.) instead import the building
-# blocks directly. The big decision loop at the end grades every page A/B/C/D by
-# how hard the FEC worked and whether its body reads as English -- it never hard-
-# drops a page, it labels confidence and lets the caller choose.
-def main():
-    cfile = sys.argv[1] if len(sys.argv) > 1 else "/tmp/flex_ab/iq_929612500_250k.cfile"
-    slicer = "perframe"
-    diag = "--diag" in sys.argv
-    for a in sys.argv[2:]:
-        if a in ("fixed", "perframe", "k4"):
-            slicer = a
 
-    mflen = SPB
-    lpf = 12000.0
-    carrier = 0.0          # channel-select offset (Hz) within the +-fs/2 capture band
-    in_rate = None         # input file sample rate (None -> assume SAMP=250k)
-    center_mhz = 929.6125  # display-only: capture center freq for labelling carriers
-    for a in sys.argv:
-        if a.startswith("--mflen="):
-            mflen = int(a.split("=", 1)[1])
-        if a.startswith("--lpf="):
-            lpf = float(a.split("=", 1)[1])
-        if a.startswith("--carrier="):
-            carrier = float(a.split("=", 1)[1])
-        if a.startswith("--samp-rate="):
-            in_rate = float(a.split("=", 1)[1])
-        if a.startswith("--center="):
-            center_mhz = float(a.split("=", 1)[1])
-    mfbank = "--mfbank" in sys.argv             # Tier 1: 4-FSK matched-filter bank
-    nocfo = "--nocfo" in sys.argv               # disable Tier 2 per-frame carrier null
-    coh = "--coh" in sys.argv                   # Tier 3: coherent per-symbol phase track
-    coh_alpha = 0.05
-    for a in sys.argv:
-        if a.startswith("--coh-alpha="):
-            coh_alpha = float(a.split("=", 1)[1])
-    inv = "--inv" in sys.argv                   # reverse tone->level map (polarity)
-    xb = None
-    # --carrier shifts a neighbouring FLEX channel down to baseband (load_baseband
-    # de-rotates by `carrier` Hz; the existing LPF then isolates it, pushing the
-    # original centre carrier out of band). Lets us decode every channel that falls
-    # within the +-125 kHz of the SAME benchmark IQ -- a true multi-carrier decode
-    # with no new capture. The sync state machine auto-detects the channel's mode.
-    if mfbank:
-        demod, xb = front_end(cfile, cfo=carrier, mf=("--mf" in sys.argv), mflen=mflen,
-                              lpf=lpf, return_baseband=True, in_rate=in_rate)
+
+
+# ---------------------------------------------------------------------------
+# Streaming interface (StreamDecoder) -- the live overlapped-batch wrapper
+# around the decode functions above. Pure numpy/scipy (no GNU Radio); the SDR
+# receivers import it from here.
+# ---------------------------------------------------------------------------
+
+FRAME_250 = int(round(FRAME_PERIOD * SAMP / FS))
+
+# Dedup-key normalization. Overlapping windows re-decode the same frame slot;
+# the low-reliability tail of a short/empty message gets Chase-corrected into
+# slightly different junk each pass -- varying whitespace and a stray trailing
+# "[nn]" -- so an exact (slot,typ,body) key emits the same logical page several
+# times. Collapse whitespace and strip trailing "[nn]" tokens for the KEY ONLY;
+# the full original body is still logged. The collapse only ever merges genuine
+# same-message duplicates (e.g. one alpha page recurring with a varying trailing
+# "[nn]" fragment counter); it never merges two distinct real pages.
+_WS_RUN = re.compile(rb"\s+")
+_TRAIL_BRACKET = re.compile(rb"(\s*\[\d+\])+\s*$")
+
+def dedup_body(body):
+    return _TRAIL_BRACKET.sub(b"", _WS_RUN.sub(b" ", body).strip()).strip()
+
+# Mirror of the validated full-strength run: matched-filter bank + correlator
+# acquisition + comb + sweep + Chase soft FEC, alpha-optimized.
+DEFAULT_CFG = dict(
+    nocfo=False, inv=False, soft=True, sweep=True, sweep_half=1, frac=False,
+    alpha_only=True, comb=True, mflen=SPB, corr_off=1517.0,
+    lpf=12000.0, in_rate=SAMP, MARGIN_OK=0.5, ALPHA_EN_OK=0.60,
+)
+
+
+def _classify(typ, body, pc, cfg):
+    """Replica of flex_batch.main()'s tier_of + the pr/en computation around it."""
+    pr = sum(1 for c in body if 32 <= c < 127) / len(body)
+    en = english_score(body) if cfg["alpha_only"] else 1.0
+    if pc is None:
+        t = "C"
+    elif pc["failed"] > 0:
+        t = "D"
+    elif pc["margin"] == pc["margin"] and pc["margin"] < cfg["MARGIN_OK"]:
+        t = "C"
+    elif pc["corrected"] or pc["chase"]:
+        t = "B"
     else:
-        demod = front_end(cfile, cfo=carrier, mf=("--mf" in sys.argv), mflen=mflen, lpf=lpf,
-                          in_rate=in_rate)
-    demod = demod - np.median(demod)            # global DC/CFO removal
-    corr = "--corr" in sys.argv                  # continuous-tracking correlator acquisition
-    corr_grid = "--corr-peaks" not in sys.argv   # comb all grid slots (vs only detected peaks)
-    corr_off = 1517.0
-    alpha_only = "--alpha" in sys.argv          # optimize for ALN/SPN: drop NUM/NNM
-    # alpha-only lets us comb aggressively: garbage numeric pages (which always
-    # look 'printable') would otherwise flood the tiers, but we discard them, and
-    # garbage alpha is self-evidently non-English (caught by the printable gate).
-    corr_thr = -1.0 if alpha_only else 0.35
-    for a in sys.argv:
-        if a.startswith("--corr-off="):
-            corr_off = float(a.split("=", 1)[1])
-        if a.startswith("--corr-thr="):
-            corr_thr = float(a.split("=", 1)[1])
-    if corr:
-        frames = corr_frames(demod, p0_offset=corr_off, grid=corr_grid,
-                             include_thr=corr_thr)
-    else:
-        fs = FlexSync(demod)
-        frames = fs.run()
-    n_anchor = len(frames)
-    if "--comb" in sys.argv:
-        frames = add_comb_frames(frames, len(demod), verbose=True)
+        t = "A"
+    if t in ("A", "B") and pr < 0.85:
+        t = "C"
+    if cfg["alpha_only"] and en < cfg["ALPHA_EN_OK"] and t in ("A", "B"):
+        t = "C"
+    return t, pr, en
 
-    _syms_list = [f["syms"] for f in frames if f.get("syms") is not None]
-    all_syms = np.concatenate(_syms_list) if _syms_list else np.array([])
-    if diag and len(all_syms):
-        v = all_syms - np.median(all_syms)
-        lo, hi = two_means(np.abs(v))
-        print(f"[diag] frames={len(frames)} datasyms={len(all_syms)}")
-        print(f"[diag] |v| inner~{lo:.3f} outer~{hi:.3f} -> adaptive thr~{(lo+hi)/2:.3f} (legacy fixed=2.0)")
-        for q in (1, 5, 25, 50, 75, 95, 99):
-            print(f"[diag]   pctl {q:2d}: v={np.percentile(v,q):+.3f}")
-        hist, edges = np.histogram(v, bins=40, range=(-6, 6))
-        peak = hist.max()
-        for h, e in zip(hist, edges):
-            bar = "#" * int(60 * h / peak)
-            print(f"[hist] {e:+5.1f} | {bar}")
 
-    xp = np.arange(len(demod), dtype=float)
+# ---------------------------------------------------------------------------
+# THE PER-WINDOW DECODE
+# ---------------------------------------------------------------------------
+# decode_window is the bridge: it takes one window of complex samples and runs
+# deFLEX's offline frame loop on it. The body is deliberately a near-verbatim
+# copy of flex_batch.main()'s loop (same acquisition, sweep, MF bank, Chase)
+# so the streamed and offline paths can never silently diverge. The ONE addition
+# is computing each frame's absolute `slot` from the window offset s0 -- that
+# global slot number is what makes cross-window de-duplication exact.
+def decode_window(xb, s0, cfg):
+    """Decode one complex-baseband window. `s0` = absolute index (250k samples)
+    of xb[0] in the stream, used to assign each frame its global slot number.
+    Returns list of (slot, typ, body_bytes, pc). This is flex_batch.main()'s frame
+    loop (lines ~998-1055) lifted verbatim, parameterized by cfg/xb/demod.
 
-    def sample_at(positions):
-        return np.interp(positions, xp, demod)
+    `xb` is the channel-selected complex baseband (post freq-xlate). If its rate
+    `cfg["in_rate"]` differs from the internal SAMP (250k) -- e.g. a live tap at
+    22050 Hz -- we polyphase-resample the window to 250k first, exactly as
+    load_baseband() does, then apply the same 127-tap channel LPF, so the
+    matched-filter bank and FM demod see identical samples to a batch run. The
+    resample+filter run per-window; their edge transient is far shorter than a
+    frame, and window overlap keeps every frame away from an edge in at least one
+    window. `s0` is in INPUT-rate samples (mapped to the 16k grid for slots)."""
+    in_rate = cfg["in_rate"]
+    if in_rate != SAMP:
+        from math import gcd
+        g = gcd(int(round(in_rate)), SAMP)
+        xb = signal.resample_poly(xb, SAMP // g, int(round(in_rate)) // g)
+    taps = signal.firwin(127, cfg["lpf"] / (SAMP / 2))
+    xb = signal.lfilter(taps, 1.0, xb)
+    demod = demod_from_baseband(xb, mf=False, mflen=cfg["mflen"])
+    demod = demod - np.median(demod)                 # global DC/CFO removal
+    corr_thr = -1.0 if cfg["alpha_only"] else 0.35
+    frames = corr_frames(demod, p0_offset=cfg["corr_off"], grid=True,
+                           include_thr=corr_thr)
+    if cfg["comb"]:
+        frames = add_comb_frames(frames, len(demod), verbose=False)
 
-    def decode_syms(syms, baud, levels, chase=False):
-        # FM-discriminator slicer path (produces hard bits + reliabilities)
-        if slicer == "fixed":
-            thr, dc = 2.0, 0.0
-        else:
-            dc = np.median(syms)
-            lo, hi = two_means(np.abs(syms - dc))
-            thr = (lo + hi) / 2
-        phases, mags = slice_soft(syms, baud, levels, thr, dc)
-        return decode_phases(phases, mags, chase=chase)
-
-    def decode_mf(pos16, baud, levels, chase=False, use_coh=False):
-        # Tier 1/2/3 path: 4-FSK matched-filter bank on the complex baseband at the
-        # given symbol centers (16 kHz units), with per-frame carrier null (Tier 2)
-        # and optional coherent per-symbol phase tracking (Tier 3).
-        cfo = 0.0 if nocfo else est_cfo(xb, pos16[0] * SAMP / FS,
-                                        pos16[-1] * SAMP / FS)
-        if use_coh:
-            C = mf_bank_mag(xb, pos16, baud, cfo=cfo, inv=inv, complex_out=True)
-            R = coherent_metric(C, baud, inv=inv, alpha=coh_alpha)
-            # resolve the carrier-mod-pi global sign: decode both, keep fewer fails
-            best = None
-            for sgn in (1.0, -1.0):
-                ba, bb, ma, mb = mfbank_softbits(sgn * R)
-                ph, mg = demux_phases(ba, bb, ma, mb, baud)
-                res = decode_phases(ph, mg, chase=chase)
-                if best is None or res[2] < best[2]:
-                    best = res
-            return best
-        metric = mf_bank_mag(xb, pos16, baud, cfo=cfo, inv=inv)
+    def decode_mf(pos16, baud, levels, chase=False):
+        cfo = 0.0 if cfg["nocfo"] else est_cfo(
+            xb, pos16[0] * SAMP / FS, pos16[-1] * SAMP / FS)
+        metric = mf_bank_mag(xb, pos16, baud, cfo=cfo, inv=cfg["inv"])
         bit_a, bit_b, mag_a, mag_b = mfbank_softbits(metric)
         phases, mags = demux_phases(bit_a, bit_b, mag_a, mag_b, baud)
         return decode_phases(phases, mags, chase=chase)
 
-    sweep = "--sweep" in sys.argv
-    frac = "--frac" in sys.argv          # sub-sample (fractional) phase search
-    soft = "--soft" in sys.argv          # Chase-II soft-decision FEC on hard fails
-    pages = []
-    bch_fail = bch_corr = bch_chase = 0
-    off_hist = {}
+    results = []
     for f in frames:
         spb = f["spb"]; p0 = f["p0"]; nsyms = f["nsyms"]
-        if not sweep:
+        if not cfg["sweep"]:
             offs = [0.0]
-        elif frac:
+        elif cfg["frac"]:
             offs = list(np.arange(-spb / 2, spb / 2, 0.5))
         else:
-            offs = [float(o) for o in range(-(spb // 2), spb - spb // 2)]
-        # symbol-parity search: 3200-baud A/C de-mux can land on the wrong
-        # symbol parity (whole frame fails). Try starting on symbol 0 or 1.
+            # Timing-phase search around the sync-locked grid. mf_bank_mag is the
+            # bulk of decode CPU and the sweep multiplies it by len(offs)*len(pars)
+            # per frame; sweep_half bounds the integer offset window. A narrow ±1
+            # (3 offsets) window decodes essentially as well as the full ±spb//2
+            # while cutting mf_bank_mag calls by ~a third. None = full width.
+            _h = cfg.get("sweep_half")
+            if _h is not None:
+                offs = [float(o) for o in range(-_h, _h + 1)]
+            else:
+                offs = [float(o) for o in range(-(spb // 2), spb - spb // 2)]
         pars = [0, 1] if f["baud"] == 3200 else [0]
         best = None
-        # sweep uses fast HARD decode to pick timing/parity; soft Chase is run
-        # once on the winner (it only helps words, never changes which sync is best)
         for par in pars:
             for off in offs:
                 base = p0 + off + par * spb
@@ -1106,124 +1022,126 @@ def main():
                 pos = base + np.arange(n) * spb
                 if pos[0] < 0 or pos[-1] >= len(demod) - 1:
                     continue
-                if mfbank:
-                    wordsets, confsets, nf, nc, _ = decode_mf(pos, f["baud"], f["levels"])
-                else:
-                    syms = sample_at(pos)
-                    wordsets, confsets, nf, nc, _ = decode_syms(syms, f["baud"], f["levels"])
+                wordsets, confsets, nf, nc, _ = decode_mf(pos, f["baud"], f["levels"])
                 if best is None or nf < best[1]:
                     best = (off, nf, nc, wordsets, confsets, par, pos)
         if best is None:
             continue
         off, nf, nc, wordsets, confsets, par, bpos = best
-        # Sweep above used the fast noncoherent hard decode to pick timing/parity.
-        # Refine the winner once with the coherent detector (Tier 3) and/or Chase.
-        if mfbank and (coh or soft):
-            wordsets, confsets, nf, nc, nch = decode_mf(
-                bpos, f["baud"], f["levels"], chase=soft, use_coh=coh)
-            bch_chase += nch
-        elif soft:
-            bsyms = sample_at(bpos)
-            wordsets, confsets, nf, nc, nch = decode_syms(bsyms, f["baud"], f["levels"], chase=True)
-            bch_chase += nch
-        key = (round(off, 1), par)
-        off_hist[key] = off_hist.get(key, 0) + 1
-        bch_fail += nf; bch_corr += nc
-        if "--pf" in sys.argv:
-            bsyms = sample_at(bpos)
-            c = kmeans4(bsyms)
-            gaps = np.diff(c)
-            # within-level spread proxy: residual after assigning to nearest center
-            d = np.abs(bsyms[:, None] - c[None, :]); lab = d.argmin(1)
-            resid = np.sqrt(np.mean((bsyms - c[lab]) ** 2))
-            merit = float(np.min(gaps) / (resid + 1e-9))
-            print(f"[pf] off={off:+.1f} par={par} fail={nf:3d} "
-                  f"c=[{c[0]:+.1f},{c[1]:+.1f},{c[2]:+.1f},{c[3]:+.1f}] "
-                  f"resid={resid:.2f} merit={merit:.2f}")
+        wordsets, confsets, nf, nc, nch = decode_mf(
+            bpos, f["baud"], f["levels"], chase=cfg["soft"])
+        abs16 = s0 * FS / cfg["in_rate"] + p0  # this frame's absolute 16k position
+        slot = int(round(abs16 / FRAME_PERIOD))
         for words, cf in zip(wordsets, confsets):
             if words is not None:
-                pages.extend(parse_frame(words, cf))
-    if sweep:
-        print(f"[sweep] chosen (offset,parity) histogram: {dict(sorted(off_hist.items()))}")
+                for cap, typ, body, pc in parse_frame(words, cf):
+                    results.append((slot, typ, body, pc))
+    return results
 
-    # confidence-graded classification (NO hard BCH gate): emit every page, score it.
-    # Tier A verified : all words clean syndrome (status 0) AND min-margin healthy.
-    # Tier B fec      : BCH-corrected or Chase-recovered words, no uncorrectable word.
-    # Tier C suspect  : passed BCH but min-margin < 0.5x local median (likely miscorrect),
-    #                   or no soft info available.
-    # Tier D failed   : >=1 uncorrectable word in the page (corrupted body).
-    MARGIN_OK = 0.5
-    ALPHA_EN_OK = 0.60   # english_score floor for a trustworthy --alpha page
-    empty = 0
-    tiers = {"A": 0, "B": 0, "C": 0, "D": 0}
-    by_tier_type = {"A": {}, "B": {}, "C": {}, "D": {}}
-    samples = []
 
-    def tier_of(pc, pr, en):
-        # RF/FEC confidence first, then a body-text sanity check: a page the RF
-        # layer is sure of but whose body isn't mostly printable is NOT a
-        # trustworthy *message* (binary/junk or a likely miscorrection), so it
-        # can't sit in A/B regardless of margin.
-        if pc is None:
-            t = "C"
-        elif pc["failed"] > 0:
-            t = "D"
-        elif pc["margin"] == pc["margin"] and pc["margin"] < MARGIN_OK:
-            t = "C"
-        elif pc["corrected"] or pc["chase"]:
-            t = "B"
-        else:
-            t = "A"
-        if t in ("A", "B") and pr < 0.85:
-            t = "C"
-        # --alpha: the comb is aggressive, so demand the body actually reads as
-        # English. This rejects Chase-manufactured garbage that slips past the
-        # printable gate, and conversely lets a genuinely-English-but-garbled
-        # message keep its FEC tier.
-        if alpha_only and en < ALPHA_EN_OK and t in ("A", "B"):
-            t = "C"
-        return t
+# ---------------------------------------------------------------------------
+# THE STREAMING SCHEDULER
+# ---------------------------------------------------------------------------
+# StreamDecoder owns the buffer and decides WHEN to decode. It accumulates fed
+# chunks, and once it holds a full window it decodes that window, emits the
+# fresh (deduped, A/B-grade) pages, then slides forward by `advance` (< window,
+# so consecutive windows overlap). On flush() it also drains the short tail.
+# The performance-critical detail is _merge_pending: we concatenate buffered
+# chunks once per window rather than once per fed chunk, because the buffer can
+# be ~120 MB and a naive per-chunk concat made that memcpy dominate live CPU.
+class StreamDecoder:
+    """Feed complex baseband (already channelized to one carrier at cfg['in_rate'],
+    default 250k) in arbitrary-sized chunks; emits trustworthy A/B alpha pages
+    exactly once each. Use `on_page` callback or read `self.pages` after `flush()`."""
 
-    dump_readable = "--dump-readable" in sys.argv   # emit ALL readable alpha pages
-    readable = []
-    for cap, typ, body, pc in pages:
-        if alpha_only and typ not in ("ALN", "SPN"):   # keep only alpha pages
-            continue
-        if len(body) == 0:
-            empty += 1; continue
-        pr = sum(1 for c in body if 32 <= c < 127) / len(body)
-        en = english_score(body) if alpha_only else 1.0
-        t = tier_of(pc, pr, en)
-        tiers[t] += 1
-        by_tier_type[t][typ] = by_tier_type[t].get(typ, 0) + 1
-        if dump_readable and en >= ALPHA_EN_OK and pr >= 0.85:
-            readable.append(body.decode("ascii", "replace"))
-        if t in ("A", "B") or len(samples) < 36:
-            mg = pc["margin"] if pc else float("nan")
-            samples.append((t, typ, mg, pr, en, body.decode("ascii", "replace")))
+    def __init__(self, cfg=None, window_frames=16, advance_frames=8, on_page=None):
+        # 16-frame (30 s) window / 8-frame (15 s) advance: corr_frames' grid_phase
+        # locks the frame grid from the sync anchors in the window, so a window
+        # needs enough anchors (~16) for its grid to match the whole-capture grid
+        # to sub-symbol precision -- otherwise a borderline page can slip just
+        # under the tier-B margin. 8/4 lost one marginal 3-char SPN; 16/8 (and
+        # larger) reproduce the batch A/B set exactly.
+        self.cfg = dict(DEFAULT_CFG, **(cfg or {}))
+        # window/advance counted in INPUT-rate samples (one frame period at in_rate)
+        self.frame_samp = int(round(FRAME_PERIOD * self.cfg["in_rate"] / FS))
+        self.window = window_frames * self.frame_samp
+        self.advance = advance_frames * self.frame_samp
+        self.on_page = on_page
+        self.buf = np.empty(0, dtype=np.complex64)
+        self._pending = []            # chunks fed but not yet merged into buf
+        self._pending_len = 0
+        self.base = 0                 # absolute input-rate index of buf[0]
+        self.seen = set()             # (slot, typ, dedup_body(body)) already emitted
+        self.pages = []               # accepted A/B pages (slot, typ, body, tier, pr, en)
 
-    fe = "mfbank" + ("" if nocfo else "+cfo") + ("+coh" if coh else "") + ("+inv" if inv else "") if mfbank else "fm-disc"
-    acq = ("corr-grid" if corr_grid else "corr-peaks") if corr else "hardsync"
-    fe = f"{fe}/{acq}"
-    ctxt = f" carrier={center_mhz + carrier/1e6:.4f}MHz (offset{carrier/1e3:+.0f}kHz)" if carrier else ""
-    print(f"=== slicer={slicer} front-end={fe} soft={soft} comb={'--comb' in sys.argv}{ctxt} ===")
-    print(f"frames        : {len(frames)} (anchors synced={n_anchor}, comb-synth={len(frames)-n_anchor})")
-    print(f"BCH corrected : {bch_corr}   Chase-recovered: {bch_chase}   BCH FAILED: {bch_fail}")
-    nonempty = sum(tiers.values())
-    print(f"pages emitted : {len(pages)}  (empty={empty}, nonempty={nonempty})")
-    print(f"confidence    : A_verified={tiers['A']}  B_fec={tiers['B']}  "
-          f"C_suspect={tiers['C']}  D_failed={tiers['D']}   (trustworthy A+B={tiers['A']+tiers['B']})")
-    print(f"by type/tier  : A={by_tier_type['A']} B={by_tier_type['B']} "
-          f"C={by_tier_type['C']} D={by_tier_type['D']}")
-    print("--- samples [tier margin printable% english] ---")
-    for t, typ, mg, pr, en, s in sorted(samples, key=lambda x: x[0]):
-        mtxt = f"{mg:4.2f}" if mg == mg else " nan"
-        entxt = f" en={en:.2f}" if alpha_only else ""
-        print(f"  [{t} m={mtxt} pr={pr:.2f}{entxt}] {typ}: {s!r}")
-    if dump_readable:
-        print("--- readable-dump ---")
-        for s in readable:
-            print(f"READABLE\t{s!r}")
+    def _emit(self, results):
+        for slot, typ, body, pc in results:
+            if self.cfg["alpha_only"] and typ not in ("ALN", "SPN"):
+                continue
+            if len(body) == 0:
+                continue
+            t, pr, en = _classify(typ, body, pc, self.cfg)
+            if t not in ("A", "B"):
+                continue
+            key = (slot, typ, dedup_body(body))
+            if key in self.seen:
+                continue
+            self.seen.add(key)
+            rec = (slot, typ, body, t, pr, en)
+            self.pages.append(rec)
+            if self.on_page:
+                self.on_page(rec)
 
-if __name__ == "__main__":
-    main()
+    def _drain(self, final=False):
+        # Slide a fixed window across the buffer, advancing by `advance` (< window
+        # for overlap). Non-final: only fire on full windows, leaving the overlap
+        # tail buffered for the next feed. Final: also process the short tail
+        # (needs >= ~1.5 frames to possibly contain a decodable frame).
+        min_final = int(1.5 * self.frame_samp)
+        while True:
+            have = len(self.buf)
+            if not final:
+                if have < self.window:
+                    return
+                self._emit(decode_window(self.buf[:self.window], self.base, self.cfg))
+                self.buf = self.buf[self.advance:]
+                self.base += self.advance
+            else:
+                if have < min_final:
+                    return
+                end = min(self.window, have)
+                self._emit(decode_window(self.buf[:end], self.base, self.cfg))
+                if end >= have:                  # tail fully covered; done
+                    self.buf = self.buf[end:]
+                    self.base += end
+                    return
+                self.buf = self.buf[self.advance:]
+                self.base += self.advance
+
+    def _merge_pending(self):
+        # Concatenate the buffer ONCE per window-fill instead of once per feed.
+        # buf can hold a full 32-frame window (~15M complex64 ≈ 120 MB); the old
+        # per-feed np.concatenate([buf, chunk]) recopied all of it for every small
+        # SDR chunk (~120 MB memcpy ×30/s at 8k-sample chunks), which dominated
+        # live CPU (py-spy: 99% in feed) and scaled inversely with chunk size.
+        if not self._pending:
+            return
+        parts = ([self.buf] if len(self.buf) else []) + self._pending
+        self.buf = parts[0] if len(parts) == 1 else np.concatenate(parts)
+        self._pending = []
+        self._pending_len = 0
+
+    def feed(self, samples):
+        s = np.asarray(samples, dtype=np.complex64)
+        self._pending.append(s)
+        self._pending_len += len(s)
+        # Only merge+drain once enough is buffered to form at least one window;
+        # _drain processes only full windows, so batching can't drop a window.
+        if len(self.buf) + self._pending_len >= self.window:
+            self._merge_pending()
+            self._drain(final=False)
+
+    def flush(self):
+        self._merge_pending()
+        self._drain(final=True)
+        return self.pages

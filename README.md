@@ -1,92 +1,89 @@
-# flexdec — a from-scratch FLEX paging decoder
+# deFLEX — a modern FLEX + POCSAG paging decoder
 
-A single-file numpy/scipy decoder for the FLEX paging protocol (TIA-1500), built
-from the spec to see whether a modern DSP front end could match or beat
-`multimon-ng` on real off-air traffic — and then grown into the live multi-carrier
-receiver that replaced multimon in production.
+A from-scratch numpy/scipy decoder for the **FLEX** (TIA-1500) and **POCSAG**
+paging protocols, built around a modern DSP front end and optimized for
+**alphanumeric** pages. On alpha traffic it **exceeds `multimon-ng`**: every page
+it emits is BCH/Chase-validated and garbage-free, and it recovers weak carriers
+that multimon renders as noise.
 
-The headline result: on a frozen 120 s benchmark capture, flexdec produces
-**FEC-validated, garbage-free** alpha decodes that are cleaner than multimon's,
-and it **decisively wins on weak carriers** — recovering a lab-temperature
-broadcast at −27.5 dB that multimon renders as noise. That same validated decode
-core now runs **live and continuously** on all five active carriers.
+## What it does
 
----
+- **FLEX and POCSAG.** FLEX at 1600 and 3200 baud, 2- and 4-level FSK, mode
+  auto-detected per frame; POCSAG-1200 alpha.
+- **Garbage-free alpha output.** A 4-FSK matched-filter detector feeds BCH(31,21)
+  forward error correction with Chase soft-decision decoding, so a decoded body is
+  either correct or not emitted — never the half-corrupted text multimon prints.
+- **Per-page confidence tiers (A/B/C/D)** fused from BCH status and a
+  FEC-independent soft margin, so a consumer can trust the A/B set outright.
+- **Strong weak-carrier recovery.** A matched-filter sync correlator plus a
+  periodic frame-grid comb pull clean pages off carriers well into the noise.
+- **Live multi-carrier reception.** The same validated decoder runs in real time
+  over an SDR — one OS process per carrier — and feeds a web viewer.
+- **Pure numpy/scipy**, with an optional numba accelerator (bit-exact fallback).
 
-## The signal
+## How it compares to `multimon-ng`
 
-FLEX is a one-way paging protocol. The benchmark carrier (929.6125 MHz, Spok
-network) is **mode 3: 3200 baud, 4-level FSK, inverted polarity**.
+On matched benchmarks (identical readability gate, deduplicated), deFLEX's
+real-message recall is comparable, but its **fidelity is categorically better**:
+multimon prints whatever it sliced — bit errors, base64 blobs, and several
+error-different copies of the same page — while deFLEX emits each message once,
+clean, or not at all. On weak / off-center carriers deFLEX **clearly wins**,
+recovering pages multimon dissolves into noise. The full comparison is in
+[`docs/decoder.md`](docs/decoder.md).
 
-| Parameter | Value | Notes |
-|---|---|---|
-| Frame period | 1.875 s = **30000 samples @ 16 kHz** | strictly periodic; 128 frames = 4-min cycle |
-| Symbol rate | 3200 / 1600 baud | mode 3 / mode 1; only ~5 samples/symbol at 16 kHz |
-| Modulation | 4-FSK (`±4800 / ±1600 Hz`) | tone spacing = baud → tones orthogonal over a symbol |
-| Frame sync | `0xA6C6AAAA` + mode codeword | packed into a 64-bit sync value |
-| Frame data | 11 blocks × 8 words = **88 words** | each word BCH(31,21) + parity |
-| FEC | BCH(31,21,5) | corrects 1, detects 2 errors per word |
+deFLEX is **not** `multimon-ng`-derived: it was built from the TIA-1500 protocol
+tables, using `gr-pager` only as a protocol reference (not linked).
 
-Optimized for **alpha** (ALN) pages — text that can be validated; numeric pages
-can't be, so they're dropped.
+## Layout
 
----
-
-## Repository layout
-
-Two protocols (FLEX + POCSAG), each with a batch decoder and a matching
-streaming wrapper, over one protocol-neutral core. The naming convention:
-**`<proto>dec.py` = batch, `online/<proto>dec_stream.py` = streaming.**
+The four **executables** live at the root; the importable **libraries** live in
+`core/`. Naming: `<proto>_core` is the decode library (and the live
+`StreamDecoder`/`POCSAGStream` wrapper), `<proto>_batch` is the offline CLI, and
+`<proto>_receiver` is the live SDR receiver.
 
 ```
-paging_core.py      ← shared, protocol-NEUTRAL core: BCH(31,21) + Chase + english_score
-flexdec.py          ← FLEX batch decoder (imports paging_core)
-flexdec_numba.py    ← FLEX-only @njit kernels (GIL-releasing) for the deinterleave hot loop
-pocsagdec.py        ← POCSAG batch decoder (imports paging_core)
+flex_receiver.py    live FLEX receiver: SDR -> per-carrier channelize -> StreamDecoder
+pocsag_receiver.py  live POCSAG receiver (single carrier)
+flex_batch.py       FLEX batch decoder (CLI) over a recorded .cfile
+pocsag_batch.py     POCSAG batch decoder (CLI)
 
-offline/            ← batch research / A-B tool  (see offline/README.md)
-  compare_ab.py       fair flexdec-vs-multimon comparison harness
-
-online/             ← live real-time receivers   (see online/README.md)
-  flexdec_stream.py     FLEX StreamDecoder: overlapped-batch replay + dedup
-  pocsagdec_stream.py   POCSAG POCSAGStream: overlapped-batch replay (emit-region)
-  flex_inmem_mp.py      production: SDR -> freq-xlate -> ring -> per-carrier PROCESS -> decoder
-  flex_inmem.py         threaded variant (GIL-bound), superseded by flex_inmem_mp.py
-  flex_stream_live.py   standalone single-carrier .cfile tail (dev)
-  pocsag_receiver.py    live POCSAG receiver (VHF fire/EMS dispatch)
-  flex-receiver-flexdec.service
-  legacy/
-    flex_7ch.py       retired multimon-ng flowgraph (kept for A/B provenance)
+core/               importable decode libraries (pure numpy/scipy, no GNU Radio)
+  paging_core.py      shared core: BCH(31,21) + Chase soft-decode + english_score gate
+  flex_core.py        FLEX decoder + the live StreamDecoder wrapper
+  flex_numba.py       optional @njit kernels for the deinterleave/BCH hot loop
+  pocsag_core.py      POCSAG decoder + the live POCSAGStream wrapper
+viewer/             web feed: tails the decode logs, streams to browsers
+docs/               decoder.md (how decoding works), receiver.md (the live receiver)
 ```
 
-- **`paging_core.py` (root)** — the protocol-NEUTRAL shared core: the BCH(31,21)
-  FEC + Chase soft-decoder and the `english_score` readability gate, imported by
-  both the FLEX and POCSAG decoders. Pure numpy/Python, no numba.
-- **`flexdec.py` / `flexdec_numba.py` (root)** — the FLEX batch decoder and its
-  FLEX-only njit deinterleave accelerator. `flexdec.py` was frozen as the
-  known-good baseline, then unfrozen 2026-05-29 to add numba acceleration; the
-  njit path is **bit-exact** vs pure Python (validated IDENTICAL A/B set, 32
-  pages) and its real win is releasing the GIL so per-carrier threads
-  parallelize. Pure-Python fallback behind a `_HAVE_NUMBA` guard.
-- **[`offline/`](offline/README.md)** — run `flexdec.py` over a frozen `.cfile`:
-  the algorithm narrative, confidence tiering, the `--alpha` English gate, the
-  full A/B-vs-multimon results, and the Phase 2 wideband (all-7-carrier) study.
-- **[`online/`](online/README.md)** — the live receiver: the streaming wrapper
-  (`StreamDecoder`), the in-memory SDR path, the 2.5 MS/s / numba / ALN-only /
-  `CPUQuota` design, the systemd unit, and the deploy notes.
+The cores are pure numpy/scipy (no GNU Radio), so the decoders — including the
+streaming wrappers — are usable as a plain library; GNU Radio is only needed for
+the live SDR receivers.
 
----
+## Quickstart
 
-## Status
+```bash
+# Decode a recorded FLEX capture (raw complex64 IQ @ 250 kS/s). The full decode
+# chain is on by default and only alpha pages are kept; add --all for every type:
+python3 flex_batch.py capture.cfile
 
-The live in-memory flexdec receiver **replaced multimon-ng in production on
-2026-05-29** (`flex-receiver.service` on the production host): RSPdx @ 2.5 MS/s → 5 carriers →
-one **`StreamDecoder` process per carrier** (`flex_inmem_mp.py`, multiprocessing
-to beat the GIL) → `/var/log/flex`, feeding the existing web viewer with no
-server change. See [`online/README.md`](online/README.md) for the full design and
-the remaining **open limitation** (per-carrier decode is single-threaded and the
-active carriers sit at ~1 core, so they accrue slow residual IQ drops — partial
-recall, not the threaded build's near-total starvation of the weak carriers).
+# Decode a POCSAG capture, printing readable pages only:
+python3 pocsag_batch.py capture.cfile --min-en 0.5
 
-The decoder is **not** GPL `multimon-ng`-derived: it was built from the TIA-1500
-tables (using `gr-pager` only as a protocol reference, not linked).
+# Run the live FLEX receiver on an SDR (carrier frequencies in MHz):
+python3 flex_receiver.py --live --carriers 929.6125,929.9375,931.2125
+
+# Run the live POCSAG receiver on a single carrier:
+python3 pocsag_receiver.py --live --freq 152.0075
+```
+
+## Documentation
+
+- **[`docs/decoder.md`](docs/decoder.md)** — how the decoder works: the DSP
+  pipeline, the 4-FSK detector, acquisition, FEC, confidence tiering, the alpha
+  readability gate, and the `multimon-ng` comparison. Plus the batch CLI usage.
+- **[`docs/receiver.md`](docs/receiver.md)** — the live SDR receiver: the
+  overlapped-batch streaming model, the per-carrier multiprocessing design, the
+  configuration parameters, and how to run it.
+- **[`viewer/README.md`](viewer/README.md)** — the web viewer that renders the
+  decoded feed.

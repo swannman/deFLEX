@@ -1,6 +1,6 @@
 """FLEX pager message tail web server.
 
-Tails /var/log/flex/*.log (written by flex-receiver.service), post-processes the
+Tails /var/log/flex/*.log (written by the receivers), post-processes the
 raw ALN decodes, and streams clean messages to browsers over a WebSocket. The
 displayed text is ONLY the human message body — no capcode/phone, frame, baud,
 or fragment metadata is ever sent to the client.

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Numba @njit kernels for the GIL-bound integer hot path of flexdec.py.
+"""Numba @njit kernels for the GIL-bound integer hot path of flex_core.py.
 
-flexdec's matched-filter bank (the 58% hotspot) is already vectorized numpy and
+deFLEX's matched-filter bank (the 58% hotspot) is already vectorized numpy and
 releases the GIL, so it parallelizes across decoder threads as-is. What does NOT
 parallelize is the per-frame BCH/deinterleave inner loop: pure-Python scalar bit
 twiddling (the 32x8 phase transpose, BCH syndrome reduction, Chase-II soft FEC)
 that holds the GIL the whole time. Those loops are what these kernels replace.
 
-The kernels are bit-exact reimplementations of flexdec._syndrome / bch3121 /
-bch3121_chase / the deinterleave_decode block loop. flexdec.py imports them with
+The kernels are bit-exact reimplementations of paging_core's _syndrome / bch3121 /
+bch3121_chase / the deinterleave_decode block loop. flex_core.py imports them with
 a pure-Python fallback and is validated to produce the identical trustworthy A/B
 page set (32 on iq_929612500_250k.cfile) with or without numba.
 
@@ -101,7 +101,7 @@ def _chase_nb(word, mag32, L, bch_arr):
 
 @njit(cache=True)
 def deint_decode_core(bits, mag, chase, L, bch_arr, rev8):
-    """Bit-exact njit core of flexdec.deinterleave_decode (have_mag branch).
+    """Bit-exact njit core of flex_core.deinterleave_decode (have_mag branch).
 
     bits : uint8[nblocks*256]    deinterleaved phase bits
     mag  : float64[nblocks*256]  per-bit reliability (same layout as bits)

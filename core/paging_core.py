@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Shared, protocol-NEUTRAL decode core for the paging receivers.
 
-Both the FLEX decoder (flexdec.py) and the POCSAG decoder (pocsagdec.py) are
-different radio protocols, but they lean on the exact same two pieces of math:
+Both the FLEX decoder (flex_core.py) and the POCSAG decoder (pocsag_core.py)
+are different radio protocols, but they lean on the exact same two pieces of math:
 
   1. BCH(31,21) forward error correction. Both protocols protect their codewords
      with the identical BCH(31,21) code (generator polynomial 0x769). 21 data
@@ -23,7 +23,7 @@ different radio protocols, but they lean on the exact same two pieces of math:
 
 Nothing in here knows about FLEX framing or POCSAG batches; it is pure
 numpy/Python with no numba dependency. Protocol-specific acceleration (e.g. the
-FLEX deinterleave njit kernels in flexdec_numba.py) lives with its protocol.
+FLEX deinterleave njit kernels in flex_numba.py) lives with its protocol.
 """
 import numpy as np
 

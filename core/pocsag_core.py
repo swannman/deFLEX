@@ -1,7 +1,10 @@
-"""POCSAG (CCIR Radio Paging Code No. 1) alpha decoder.
+"""POCSAG (CCIR Radio Paging Code No. 1) alpha decoder CORE.
 
-Sibling to flexdec.py for the paging rig. Focus: alphanumeric pages only
-(the 7-bit-ASCII message type) -- numeric/tone pages are ignored.
+Sibling to flex_core.py for the paging rig: the importable library (decode
+functions + constants). The batch CLI is pocsag_batch.py; the live
+streaming wrapper (POCSAGStream) lives at the bottom of this file. Focus:
+alphanumeric pages only (the 7-bit-ASCII message type) -- numeric/tone pages are
+ignored.
 
 =============================================================================
 A PRIMER FOR THE READER WHO IS A SOFTWARE ENGINEER BUT NOT AN RF ENGINEER
@@ -39,12 +42,10 @@ processing on arrays of numbers" -- there is no analog magic hiding in here.
    bit? The middle of the bit is cleanest (the open centre of the "eye
    diagram"); the edges are where the signal is sliding between tones. Many
    receivers run a feedback loop (Mueller & Muller, Gardner, ...) to lock onto
-   that centre. We do something simpler and just as good here because the frame
-   sync re-appears constantly: we try ALL 8 sampling phases (and both tone
-   polarities) and keep whichever one makes the known sync word appear most
-   often. See `decode_demod`. (Note: an earlier draft of this docstring claimed
-   Mueller&Muller recovery -- there is no M&M loop; the brute phase search
-   replaced it.)
+   that centre. This decoder does something simpler and just as good, because the
+   frame sync re-appears constantly: it tries ALL 8 sampling phases (and both tone
+   polarities) and keeps whichever one makes the known sync word appear most
+   often. See `decode_demod`.
 
 5. ERROR CORRECTION (`_decode_word` -> paging_core BCH + Chase).
    The air is noisy, so POCSAG wraps every 32-bit codeword in a BCH(31,21)
@@ -82,7 +83,7 @@ THE WIRE FORMAT (2-FSK NRZ)
   Alpha text = payload bits of consecutive message codewords concatenated in
   transmission order, sliced into 7-bit chars LSB-first (first bit = char LSB).
 
-  The gotcha that bites everyone: POCSAG splits each batch into 8 numbered
+  An important subtlety: POCSAG splits each batch into 8 numbered
   "frames", and a given pager only listens in the one frame its address hashes
   to (a power-saving trick -- the receiver can sleep the other 7/8 of the time).
   The 18-bit address carried in the codeword therefore DROPS its low 3 bits;
@@ -422,36 +423,90 @@ def decode_baseband(x, in_rate=IN_RATE_DEFAULT, on_page=None):
     return decode_demod(y, on_page=on_page)
 
 
+
+
 # ---------------------------------------------------------------------------
-# STREAMING WRAPPER
+# Streaming interface (POCSAGStream) -- the live overlap-save wrapper around
+# the decode functions above. Pure numpy (no GNU Radio); the receiver imports
+# it from here.
 # ---------------------------------------------------------------------------
-# The live-receiver streaming wrapper (POCSAGStream, overlap-save) lives in
-# online/pocsagdec_stream.py -- the POCSAG analogue of online/flexdec_stream.py.
-# It imports this module for the batch decode. Run that file directly to A/B the
-# streamed decode against this batch decode.
 
+class POCSAGStream:
+    """Feed complex baseband (one carrier @ in_rate, default 250k) in arbitrary
+    chunks; emits alpha pages once each via on_page(addr, func, text) or read
+    self.pages after flush(). Sibling of the FLEX StreamDecoder (in flex_core.py).
 
-def _main():
-    import argparse
-    ap = argparse.ArgumentParser()
-    ap.add_argument("cfile")
-    ap.add_argument("--in-rate", type=float, default=IN_RATE_DEFAULT)
-    ap.add_argument("--min-en", type=float, default=0.0,
-                    help="english_score floor to print a page (0 = print all)")
-    args = ap.parse_args()
-    x = np.fromfile(args.cfile, dtype=np.complex64)
-    pages = decode_baseband(x, in_rate=args.in_rate)
-    shown = 0
-    for addr, func, text, _pos in pages:
-        en = PC.english_score(text)
-        if en < args.min_en:
-            continue
-        shown += 1
-        body = text.decode("ascii", "replace")
-        print(f"cap={addr:>8} f={func} en={en:.2f}  {body!r}")
-    print(f"\n{len(pages)} alpha pages decoded, {shown} shown "
-          f"(en>={args.min_en})", file=sys.stderr)
+    Unlike FLEX (frame-periodic on a shared clock) POCSAG has no global slot, so
+    we slide an overlapped window over the buffer and re-run the validated batch
+    decode per window. Exactly-once emission comes from overlap-save: a window
+    only emits pages whose address codeword starts within its first `advance`
+    symbols, so every emitted page has the full (window - advance) overlap left
+    to contain its message. With overlap >= the longest transmission, no page is
+    truncated at an edge and none lands in two windows' emit regions -- so no
+    de-dup is needed. The final flush emits its whole tail."""
 
+    def __init__(self, in_rate=IN_RATE_DEFAULT, window_s=30.0, advance_s=25.0,
+                 on_page=None):
+        self.in_rate = in_rate
+        self.window = int(window_s * in_rate)
+        self.advance = int(advance_s * in_rate)
+        self.advance_syms = int(advance_s * BAUD)   # emit cutoff (symbol units)
+        self.on_page = on_page
+        self.buf = np.empty(0, dtype=np.complex64)
+        self._pending = []
+        self._pending_len = 0
+        self.base = 0                  # absolute input-sample index of buf[0]
+        self.pages = []                # (addr, func, text)
 
-if __name__ == "__main__":
-    _main()
+    def _emit(self, win_pages, emit_all):
+        for addr, func, text, pos in win_pages:
+            if not emit_all and pos >= self.advance_syms:
+                continue               # overlap region: the next window emits it
+            rec = (addr, func, text)
+            self.pages.append(rec)
+            if self.on_page:
+                self.on_page(rec)
+
+    def _merge_pending(self):
+        if not self._pending:
+            return
+        parts = ([self.buf] if len(self.buf) else []) + self._pending
+        self.buf = parts[0] if len(parts) == 1 else np.concatenate(parts)
+        self._pending = []
+        self._pending_len = 0
+
+    def _drain(self, final=False):
+        while True:
+            have = len(self.buf)
+            if not final:
+                if have < self.window:
+                    return
+                self._emit(decode_baseband(self.buf[:self.window], self.in_rate),
+                           emit_all=False)
+                self.buf = self.buf[self.advance:]
+                self.base += self.advance
+            else:
+                if have <= self.window:    # tail fits one window -> emit all of it
+                    if have:
+                        self._emit(decode_baseband(self.buf, self.in_rate),
+                                   emit_all=True)
+                    self.buf = self.buf[have:]
+                    self.base += have
+                    return
+                self._emit(decode_baseband(self.buf[:self.window], self.in_rate),
+                           emit_all=False)
+                self.buf = self.buf[self.advance:]
+                self.base += self.advance
+
+    def feed(self, samples):
+        s = np.asarray(samples, dtype=np.complex64)
+        self._pending.append(s)
+        self._pending_len += len(s)
+        if len(self.buf) + self._pending_len >= self.window:
+            self._merge_pending()
+            self._drain(final=False)
+
+    def flush(self):
+        self._merge_pending()
+        self._drain(final=True)
+        return self.pages

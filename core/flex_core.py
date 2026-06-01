@@ -4,7 +4,7 @@ tables in gr-pager. Front-end + faithful sign-based sync state machine, a 4-FSK
 matched-filter detector, BCH-gated output, and confidence tiering.
 
 This module is the importable library: constants + decode functions + FlexSync +
-the live `StreamDecoder` wrapper (at the bottom of this file). Pure numpy/scipy,
+the live `FLEXStream` wrapper (at the bottom of this file). Pure numpy/scipy,
 no GNU Radio. The batch CLI (`flex_batch.py`) and the SDR receiver
 (`flex_receiver.py`) both build on it.
 
@@ -898,7 +898,7 @@ def add_comb_frames(frames, total_len, verbose=False):
 
 
 # ---------------------------------------------------------------------------
-# Streaming interface (StreamDecoder) -- the live overlapped-batch wrapper
+# Streaming interface (FLEXStream) -- the live overlapped-batch wrapper
 # around the decode functions above. Pure numpy/scipy (no GNU Radio); the SDR
 # receivers import it from here.
 # ---------------------------------------------------------------------------
@@ -1040,14 +1040,14 @@ def decode_window(xb, s0, cfg):
 # ---------------------------------------------------------------------------
 # THE STREAMING SCHEDULER
 # ---------------------------------------------------------------------------
-# StreamDecoder owns the buffer and decides WHEN to decode. It accumulates fed
+# FLEXStream owns the buffer and decides WHEN to decode. It accumulates fed
 # chunks, and once it holds a full window it decodes that window, emits the
 # fresh (deduped, A/B-grade) pages, then slides forward by `advance` (< window,
 # so consecutive windows overlap). On flush() it also drains the short tail.
 # The performance-critical detail is _merge_pending: we concatenate buffered
 # chunks once per window rather than once per fed chunk, because the buffer can
 # be ~120 MB and a naive per-chunk concat made that memcpy dominate live CPU.
-class StreamDecoder:
+class FLEXStream:
     """Feed complex baseband (already channelized to one carrier at cfg['in_rate'],
     default 250k) in arbitrary-sized chunks; emits trustworthy A/B alpha pages
     exactly once each. Use `on_page` callback or read `self.pages` after `flush()`."""

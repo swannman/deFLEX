@@ -17,8 +17,10 @@ that multimon renders as noise.
   FEC-independent soft margin, so a consumer can trust the A/B set outright.
 - **Strong weak-carrier recovery.** A matched-filter sync correlator plus a
   periodic frame-grid comb pull clean pages off carriers well into the noise.
-- **Live multi-carrier reception.** The same validated decoder runs in real time
-  over an SDR — one OS process per carrier — and feeds a web viewer.
+- **Live multi-carrier, multi-protocol reception.** A harness tunes one SDR,
+  channelizes the captured band, and runs the right decoder per carrier — one OS
+  process each. A single frequency can be decoded as **both** FLEX and POCSAG (for
+  a channel that carries both). Feeds a web viewer.
 - **Pure numpy/scipy**, with an optional numba accelerator (bit-exact fallback).
 
 ## How it compares to `multimon-ng`
@@ -36,29 +38,35 @@ tables, using `gr-pager` only as a protocol reference (not linked).
 
 ## Layout
 
-The four **executables** live at the root; the importable **libraries** live in
+The **executables** live at the root; the importable **libraries** live in
 `core/`. Naming: `<proto>_core` is the decode library (and the live
-`StreamDecoder`/`POCSAGStream` wrapper), `<proto>_batch` is the offline CLI, and
-`<proto>_receiver` is the live SDR receiver.
+`FLEXStream`/`POCSAGStream` wrapper), `<proto>_batch` is the offline CLI, and
+`<proto>_receiver` is the single-carrier live receiver. `start_receiver.py` is the
+multi-carrier, multi-protocol harness.
 
 ```
-flex_receiver.py    live FLEX receiver: SDR -> per-carrier channelize -> StreamDecoder
-pocsag_receiver.py  live POCSAG receiver (single carrier)
+start_receiver.py   live harness: one SDR -> channelize -> a decoder per carrier
+                    (--flex / --pocsag lists; a shared freq gets both)
+flex_receiver.py    single-carrier live FLEX receiver (+ --file replay)
+pocsag_receiver.py  single-carrier live POCSAG receiver (+ --file replay)
 flex_batch.py       FLEX batch decoder (CLI) over a recorded .cfile
 pocsag_batch.py     POCSAG batch decoder (CLI)
 
-core/               importable decode libraries (pure numpy/scipy, no GNU Radio)
+core/               importable library modules
   paging_core.py      shared core: BCH(31,21) + Chase soft-decode + english_score gate
-  flex_core.py        FLEX decoder + the live StreamDecoder wrapper
+  flex_core.py        FLEX decoder + the live FLEXStream wrapper
   flex_numba.py       optional @njit kernels for the deinterleave/BCH hot loop
   pocsag_core.py      POCSAG decoder + the live POCSAGStream wrapper
+  receiver_core.py    shared decode-worker layer + log callbacks (no GNU Radio)
+  receiver_sdr.py     SoapySDR source + channelization (the one GNU-Radio module)
 viewer/             web feed: tails the decode logs, streams to browsers
 docs/               decoder.md (how decoding works), receiver.md (the live receiver)
 ```
 
-The cores are pure numpy/scipy (no GNU Radio), so the decoders — including the
-streaming wrappers — are usable as a plain library; GNU Radio is only needed for
-the live SDR receivers.
+The decode cores are pure numpy/scipy, so the decoders — including the streaming
+wrappers (`FLEXStream`, `POCSAGStream`) and the offline `--file` paths — are usable
+without GNU Radio. Only live SDR capture pulls it in: `core/receiver_sdr.py`, used
+by `start_receiver.py` and the receivers' `--live` mode.
 
 ## Quickstart
 
@@ -70,10 +78,13 @@ python3 flex_batch.py capture.cfile
 # Decode a POCSAG capture, printing readable pages only:
 python3 pocsag_batch.py capture.cfile --min-en 0.5
 
-# Run the live FLEX receiver on an SDR (carrier frequencies in MHz):
-python3 flex_receiver.py --live --carriers 929.6125,929.9375,931.2125
+# Live: one SDR, several FLEX carriers + a POCSAG carrier (all in MHz, all within
+# one capture window). A frequency in both lists is decoded as FLEX and POCSAG:
+python3 start_receiver.py --flex 930.5,931.5 --pocsag 931.5,931.8
+python3 start_receiver.py --flex 930.5,931.5 --pocsag 931.8 --dry-run   # preview, no SDR
 
-# Run the live POCSAG receiver on a single carrier:
+# Or a single carrier on its own SDR:
+python3 flex_receiver.py   --live --freq 931.2125
 python3 pocsag_receiver.py --live --freq 152.0075
 ```
 

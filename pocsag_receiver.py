@@ -1,183 +1,64 @@
 #!/usr/bin/env python3
-"""Live POCSAG alpha-paging receiver (single carrier).
+"""Live POCSAG receiver (single carrier).
 
-POCSAG dispatch channels sit far from the FLEX band, so this runs on its OWN SDR
-(default RTL-SDR) rather than sharing the FLEX tuner. A single carrier needs only
-one decode thread behind a drop-oldest ring. It uses the POCSAGStream decoder (in
-pocsag_core) and emits the SAME log line shape the FLEX receiver writes, so the
-web viewer renders POCSAG pages with no change:
+Decodes ONE POCSAG carrier: its own SDR tuned to the carrier, channelized to
+250 kS/s, fed to a POCSAGStream decoder. For multiple carriers -- or mixed
+FLEX/POCSAG on one SDR, including a channel that carries both -- use
+start_receiver.py instead.
 
+It emits the SAME log-line shape the FLEX path writes, so the web viewer renders
+POCSAG pages with no change:
     <ts> FLEX|<carrier>|0|A|<capcode>|ALN|<body>
-
-The capcode goes in the field the viewer dedups on (the FLEX path hardcodes "0"
-there; POCSAG has a real RIC, so it is used here -- retransmits of the same page
-on the same capcode collapse in the viewer's (capcode, body) de-dup).
+The capcode (real RIC) sits in the field the viewer dedups on, so retransmits of
+the same page collapse in the viewer's (capcode, body) de-dup.
 
 Modes:
-  --live --freq MHz [--driver rtlsdr|sdrplay] [--log DIR]   live SDR
-  --file CFILE [--freq MHz] [--in-rate HZ]                  replay a recorded capture
+  --live --freq MHZ [--driver rtlsdr|sdrplay] [--log DIR]   own SDR, one carrier
+  --file CFILE [--freq MHZ] [--in-rate HZ]                  replay a capture
+
+The --file path uses only numpy/scipy (no GNU Radio); --live needs GNU Radio.
 """
 import argparse
 import os
 import sys
-import time
 
 import numpy as np
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-# pocsag_core + paging_core live in core/; the flat /usr/local/bin install
-# co-locates everything -- cover both layouts.
 sys.path.insert(0, os.path.join(_HERE, "core"))
 sys.path.insert(0, _HERE)
 import pocsag_core as P
-
-RX_RATE = 250000            # RTL-SDR low-rate regime; POCSAGStream resamples to 9600
-EN_FLOOR = 0.45             # english_score floor inside P.is_clean_alpha. 0.45 is a
-                            # conservative readability gate; it also drops sub-12
-                            # char and control-char FEC fragments.
-LOG_DIR = "/var/log/flex"
-QUEUE_MAXCHUNKS = 256       # ~one window-decode of input @ 250k; drop-oldest on full
-
-
-def make_on_page(log_path, carrier):
-    """Return an on_page(rec) callback that gates by english_score and appends
-    the viewer-compatible FLEX| log line (or prints it if log_path is None)."""
-    lf = open(log_path, "a", buffering=1) if log_path else None
-
-    def on_page(rec):
-        addr, func, text = rec
-        if not P.is_clean_alpha(text, EN_FLOOR):
-            return
-        body = (text.decode("ascii", "replace")
-                .replace("\\", "\\\\").replace("\n", "\\n")
-                .replace("\r", "\\r").replace("\t", "\\t"))
-        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        line = "%s FLEX|%d|0|A|%d|ALN|%s" % (ts, carrier, addr, body)
-        if lf is not None:
-            lf.write(line + "\n")
-        else:
-            print(line)
-
-    return on_page
+import receiver_core as RC
 
 
 def run_file(cfile, in_rate, carrier, log_path=None):
     """Feed a capture through POCSAGStream exactly as the live path would."""
-    on_page = make_on_page(log_path, carrier)
+    lf = open(log_path, "a", buffering=1) if log_path else None
+    ps = P.POCSAGStream(in_rate=in_rate, on_page=RC.make_pocsag_on_page(carrier, lf))
     x = np.fromfile(cfile, dtype=np.complex64)
-    ps = P.POCSAGStream(in_rate=in_rate, on_page=on_page)
     chunk = int(2.0 * in_rate)
     for i in range(0, len(x), chunk):
         ps.feed(x[i:i + chunk])
     ps.flush()
     print(f"pocsag_receiver file: {len(ps.pages)} pages "
-          f"({len(x)/in_rate:.1f}s @ {in_rate/1e3:.0f}k, en>={EN_FLOOR} logged)",
+          f"({len(x)/in_rate:.1f}s @ {in_rate/1e3:.0f}k, en>={RC.EN_FLOOR} logged)",
           file=sys.stderr)
     return len(ps.pages)
 
 
-# --- live path (RTL-SDR via SoapySDR + GNU Radio) ---------------------------
-# Imported lazily so file mode runs on a box without GNU Radio installed.
-
-def run_live(log_dir, freq, driver="rtlsdr"):
-    import queue
-    import threading
-    from gnuradio import gr, blocks, soapy
-
-    carrier = int(freq)
-    os.makedirs(log_dir, exist_ok=True)
-    log_path = f"{log_dir}/{carrier}.pocsag.log"
-    q = queue.Queue(maxsize=QUEUE_MAXCHUNKS)
-    dropped = {"n": 0}
-
-    class PocsagSink(gr.sync_block):
-        """complex64 -> queue (drop-oldest on overflow), same contract as the
-        FLEX RingSink: a slow decode never back-pressures the SDR."""
-
-        def __init__(self):
-            gr.sync_block.__init__(self, name="pocsag_sink",
-                                   in_sig=[np.complex64], out_sig=None)
-
-        def work(self, input_items, output_items):
-            x = input_items[0]
-            chunk = np.asarray(x, dtype=np.complex64).copy()
-            try:
-                q.put_nowait(chunk)
-            except queue.Full:
-                try:
-                    q.get_nowait()
-                    dropped["n"] += 1
-                except queue.Empty:
-                    pass
-                try:
-                    q.put_nowait(chunk)
-                except queue.Full:
-                    pass
-            return len(x)
-
-    ps = P.POCSAGStream(in_rate=RX_RATE, on_page=make_on_page(log_path, carrier))
-
-    def worker():
-        while True:
-            try:
-                chunk = q.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            if chunk is None:
-                ps.flush()
-                return
-            chunks = [chunk]
-            try:
-                while True:
-                    c = q.get_nowait()
-                    if c is None:
-                        ps.feed(np.concatenate(chunks))
-                        ps.flush()
-                        return
-                    chunks.append(c)
-            except queue.Empty:
-                pass
-            ps.feed(np.concatenate(chunks))
-
-    class LiveGraph(gr.top_block):
-        def __init__(self):
-            gr.top_block.__init__(self, "pocsag_receiver_live")
-            self.src = soapy.source(f"driver={driver}", "fc32", 1, "", "", [""], [""])
-            self.src.set_sample_rate(0, RX_RATE)   # 250k: native on RTL & RSPdx
-            self.src.set_frequency(0, freq)
-            self.src.set_gain_mode(0, True)        # AGC; signal is strong
-            self.sink = PocsagSink()
-            self.connect(self.src, self.sink)
-
-    t = threading.Thread(target=worker, daemon=True)
-    t.start()
-    tb = LiveGraph()
-    print(f"pocsag_receiver LIVE: {driver} @ {freq/1e6:.4f} MHz, {RX_RATE} S/s -> "
-          f"POCSAGStream -> {log_path}", file=sys.stderr, flush=True)
-    tb.start()
-    try:
-        while True:
-            time.sleep(30)
-            print(f"[pocsag] pages={len(ps.pages)} dropped={dropped['n']}",
-                  file=sys.stderr, flush=True)
-    except KeyboardInterrupt:
-        tb.stop(); tb.wait()
-        q.put(None)
-        t.join(timeout=5)
-
-
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description="Single-carrier live POCSAG receiver. For multi-carrier or mixed "
+                    "FLEX/POCSAG, use start_receiver.py.")
     ap.add_argument("--file")
-    ap.add_argument("--in-rate", type=float, default=float(RX_RATE))
+    ap.add_argument("--in-rate", type=float, default=float(RC.CHAN_RATE))
     ap.add_argument("--live", action="store_true")
     ap.add_argument("--freq", type=float,
-                    help="POCSAG carrier frequency in MHz, e.g. 152.0075. "
-                         "Required for --live; also tags --file log lines.")
+                    help="POCSAG carrier frequency in MHz. Required for --live; "
+                         "also tags --file log lines.")
     ap.add_argument("--driver", default="rtlsdr",
-                    help="SoapySDR driver for --live (rtlsdr|sdrplay). "
-                         "Use sdrplay to time-share the FLEX RSPdx.")
-    ap.add_argument("--log", help="log dir (live) or file (file mode); default stdout")
+                    help="SoapySDR driver for --live (rtlsdr|sdrplay)")
+    ap.add_argument("--log", help=f"log directory for --live (default {RC.LOG_DIR})")
     args = ap.parse_args()
     if args.file:
         carrier = int(round(args.freq * 1e6)) if args.freq is not None else 0
@@ -185,7 +66,10 @@ def main():
     elif args.live:
         if args.freq is None:
             ap.error("--live requires --freq (carrier frequency in MHz)")
-        run_live(args.log or LOG_DIR, int(round(args.freq * 1e6)), driver=args.driver)
+        freq = int(round(args.freq * 1e6))
+        import receiver_sdr       # GNU Radio; imported only for the live path
+        receiver_sdr.run_live([], [freq], freq, driver=args.driver,
+                              log_dir=args.log or RC.LOG_DIR)
     else:
         ap.error("specify --file CFILE or --live")
 

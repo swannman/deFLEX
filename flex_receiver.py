@@ -1,295 +1,70 @@
 #!/usr/bin/env python3
-"""Live FLEX receiver: SDR -> per-carrier channel-select -> one OS process per
-carrier running a StreamDecoder. Decodes many FLEX carriers concurrently in real
-time, with no intermediate audio file between the SDR and the decoder.
+"""Live FLEX receiver (single carrier).
 
-Each carrier owns its own process (own GIL), so the per-carrier matched-filter
-bank + Chase-II decode parallelizes across cores: GNU Radio's flowgraph stays in
-the parent, and complex64 baseband chunks cross to the worker processes via an
-mp.Queue (drop-oldest on overflow, so a slow decode never back-pressures the SDR).
-The StreamDecoder (in flex_core) re-runs the validated batch decode on overlapping
-windows and de-duplicates by frame slot, so the live output matches batch exactly.
+Decodes ONE FLEX carrier: its own SDR tuned to the carrier, channelized to 250 kS/s,
+fed to a FLEXStream decoder. For multiple carriers -- or mixed FLEX/POCSAG on one
+SDR, including a channel that carries both -- use start_receiver.py instead.
 
 Modes:
-  --live --carriers MHz,MHz,... [--center MHz] [--log DIR]
-                                live SDR, one process per carrier. Carrier
-                                frequencies are given in MHz; the tuner center
-                                defaults to their midpoint.
-  --file CFILE [--in-rate HZ]   replay a recorded capture through the same path
-                                (a single-carrier parity check vs the batch decoder)
+  --live --freq MHZ [--driver ...] [--log DIR]   own SDR, one carrier
+  --file CFILE [--in-rate HZ]                     replay a recorded capture through
+                                                  FLEXStream (parity vs flex_batch)
 
-See docs/receiver.md for the architecture.
+The --file path uses only numpy/scipy (no GNU Radio); --live needs GNU Radio.
 """
 import argparse
 import os
-import queue
 import sys
-import time
-import multiprocessing as mp
 
 import numpy as np
-from gnuradio import gr, blocks, filter, soapy
-from gnuradio.filter import firdes
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-# Shared decode core lives in core/; the flat /usr/local/bin install co-locates
-# everything -- cover both layouts.
 sys.path.insert(0, os.path.join(_HERE, "core"))
 sys.path.insert(0, _HERE)
 import flex_core as F
-
-SAMP_RATE  = 2_500_000                    # /10 -> 250000 == flex_core.SAMP: no resample_poly
-DECIM      = 10
-IN_RATE    = SAMP_RATE // DECIM           # 250000 Hz complex baseband (== F.SAMP)
-WINDOW_FR  = 32                           # see StreamDecoder: >=16 reproduces batch
-ADVANCE_FR = 28                           # 4-frame edge margin, ~0.54x realtime/carrier
-
-LOG_DIR = "/var/log/flex"
+import receiver_core as RC
 
 
-class RingSink(gr.sync_block):
-    """complex64 sink -> mp.Queue (drop-oldest on overflow). Lives in the parent
-    (flowgraph) process; the queue carries copied chunks to a worker PROCESS.
-    The queue's bound is set by the caller via maxsize on the mp.Queue."""
-
-    def __init__(self, carrier, q):
-        gr.sync_block.__init__(self, name=f"ring_{carrier}",
-                               in_sig=[np.complex64], out_sig=None)
-        self.q = q
-        self.dropped_chunks = 0
-
-    def work(self, input_items, output_items):
-        x = input_items[0]
-        # Must copy: GNU Radio reuses the input buffer, but mp.Queue pickles
-        # asynchronously in a feeder thread after put() returns.
-        chunk = np.asarray(x, dtype=np.complex64).copy()
-        try:
-            self.q.put_nowait(chunk)
-        except queue.Full:
-            try:
-                self.q.get_nowait()          # drop oldest
-                self.dropped_chunks += 1
-            except queue.Empty:
-                pass
-            try:
-                self.q.put_nowait(chunk)
-            except queue.Full:
-                pass
-        return len(x)
-
-
-def worker_proc(carrier, q, in_rate, window, advance, log_path, pages_val):
-    """Runs in its own process: drains the mp.Queue, feeds a StreamDecoder.
-    Coalesces any backlog into one feed() so the scheduler sees big blocks.
-    `None` on the queue is the EOF sentinel (file mode) -> flush and exit.
-    pages_val (mp.Value 'i') mirrors len(sd.pages) for the parent's stats."""
+def run_file(cfile, in_rate, log_path=None):
+    """Replay a capture through FLEXStream exactly as the live path would, then
+    report the trustworthy A/B page count (parity check vs flex_batch)."""
     lf = open(log_path, "a", buffering=1) if log_path else None
-
-    def on_page(rec):
-        if lf is None:
-            return
-        slot, typ, body, tier, pr, en = rec
-        # ALN only -- SPN decodes to control-char garbage on these carriers.
-        if typ != "ALN":
-            return
-        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        text = (body.decode("ascii", "replace")
-                .replace("\\", "\\\\").replace("\n", "\\n")
-                .replace("\r", "\\r").replace("\t", "\\t"))
-        lf.write("%s FLEX|%d|%d|%s|0|ALN|%s\n" % (ts, carrier, slot, tier, text))
-
-    sd = F.StreamDecoder(cfg=dict(in_rate=in_rate),
-                         window_frames=window, advance_frames=advance,
-                         on_page=on_page)
-
-    def finish():
-        sd.flush()
-        pages_val.value = len(sd.pages)
-
-    while True:
-        try:
-            chunk = q.get(timeout=0.5)
-        except queue.Empty:
-            continue
-        if chunk is None:
-            finish()
-            return
-        chunks = [chunk]
-        eof = False
-        try:
-            while True:
-                c = q.get_nowait()
-                if c is None:
-                    eof = True
-                    break
-                chunks.append(c)
-        except queue.Empty:
-            pass
-        sd.feed(np.concatenate(chunks))
-        pages_val.value = len(sd.pages)
-        if eof:
-            finish()
-            return
-
-
-# ---------------------------------------------------------------------------
-
-class FileGraph(gr.top_block):
-    """file_source -> RingSink for the single-carrier parity check."""
-
-    def __init__(self, cfile, q):
-        gr.top_block.__init__(self, "flex_receiver_file")
-        self.src = blocks.file_source(gr.sizeof_gr_complex, cfile, False)
-        self.ring = RingSink("file", q)
-        self.connect(self.src, self.ring)
-
-
-class LiveGraph(gr.top_block):
-    """SoapySDR RSPdx -> per-carrier freq_xlate -> RingSink (one mp.Queue each)."""
-
-    def __init__(self, queues, carriers, center, driver="sdrplay"):
-        gr.top_block.__init__(self, "flex_receiver_live")
-        self.src = soapy.source(f"driver={driver}", "fc32", 1, "", "", [""], [""])
-        self.src.set_sample_rate(0, SAMP_RATE)
-        self.src.set_frequency(0, center)
-        self.src.set_gain_mode(0, False)
-        self.src.set_gain(0, "RFGR", 4)
-        self.src.set_gain(0, "IFGR", 25)
-        self.src.set_antenna(0, "Antenna A")
-
-        # Wide transition band on purpose: after decimate-by-DECIM the first
-        # alias folds in at IN_RATE-9000 ~= 241 kHz, so a 60 kHz transition still
-        # leaves huge guard. A 3 kHz transition forced ~2750 taps/carrier at the
-        # full 2.5 MS/s input rate -> the SDR overran. ~137 taps fixes it.
-        taps = firdes.low_pass(1.0, SAMP_RATE, 9000, 60000)
-        self.rings = {}
-        self._blocks = []
-        for carrier in carriers:
-            offset = carrier - center
-            xlate = filter.freq_xlating_fir_filter_ccc(DECIM, taps, offset, SAMP_RATE)
-            ring = RingSink(carrier, queues[carrier])
-            self.connect(self.src, xlate, ring)
-            self.rings[carrier] = ring
-            self._blocks += [xlate, ring]
-
-
-# ---------------------------------------------------------------------------
-
-def run_file(cfile, in_rate):
-    q = mp.Queue()                       # unbounded: no drops in parity test
-    pages_val = mp.Value('i', 0)
-    p = mp.Process(target=worker_proc,
-                   args=("file", q, in_rate, WINDOW_FR, ADVANCE_FR, None, pages_val),
-                   daemon=True)
-    p.start()
-
-    tb = FileGraph(cfile, q)
-    t0 = time.time()
-    tb.start()
-    tb.wait()                            # file_source EOF
-    q.put(None)                          # sentinel -> worker flush + exit
-    p.join()
-    dt = time.time() - t0
-
-    n_samp = os.path.getsize(cfile) // 8
-    secs = n_samp / in_rate
-    print(f"file={cfile}")
-    print(f"in_rate={in_rate} samples={n_samp} ({secs:.1f}s of IQ)")
-    print(f"window={WINDOW_FR}fr advance={ADVANCE_FR}fr")
-    print(f"trustworthy A/B alpha pages (via per-process ring->proc): {pages_val.value}")
-    print(f"wall={dt:.1f}s  ({dt/secs:.2f}x realtime, single carrier)")
-    return pages_val.value
-
-
-# Per-carrier queue depth. Every carrier runs the same overlapped-window DSP
-# (matched-filter bank + sync correlation) each window, regardless of content,
-# so the worker stops draining for the multi-second decode burst. Average
-# decode keeps up (<1 core), so the worker catches up between bursts -- the
-# queue just has to hold one window-decode's worth of input. At 64 it overflowed
-# during every burst (~30 drops/s/carrier); 1024 (~17 s @ 250 kS/s, ~64 MB/carrier
-# worst case) absorbs the burst with no recall risk (window stays at 32).
-QUEUE_MAXCHUNKS = 1024
-
-
-def run_live(carriers, center, driver="sdrplay", log_dir=LOG_DIR):
-    os.makedirs(log_dir, exist_ok=True)
-    queues = {c: mp.Queue(maxsize=QUEUE_MAXCHUNKS) for c in carriers}
-    pages = {c: mp.Value('i', 0) for c in carriers}
-
-    procs = {}
-    for carrier in carriers:
-        p = mp.Process(target=worker_proc,
-                       args=(carrier, queues[carrier], IN_RATE, WINDOW_FR,
-                             ADVANCE_FR, f"{log_dir}/{carrier}.flexdec.log",
-                             pages[carrier]),
-                       daemon=True)
-        p.start()
-        procs[carrier] = p
-
-    tb = LiveGraph(queues, carriers, center, driver=driver)
-    print(f"flex_receiver LIVE: {driver} @ {center/1e6:.4f} MHz, {SAMP_RATE} S/s -> "
-          f"{len(carriers)} carriers @ {IN_RATE} Hz -> StreamDecoder PROCESSES "
-          f"(window={WINDOW_FR} advance={ADVANCE_FR}) numba={F._HAVE_NUMBA} "
-          f"resample={'OFF' if IN_RATE == F.SAMP else 'ON'}",
-          file=sys.stderr, flush=True)
-    tb.start()
-    try:
-        while True:
-            time.sleep(30)
-            drops = {c: tb.rings[c].dropped_chunks for c in carriers}
-            pgs = {c: pages[c].value for c in carriers}
-            print(f"[inmem-mp] pages={pgs} dropped={drops}", file=sys.stderr, flush=True)
-    except KeyboardInterrupt:
-        tb.stop(); tb.wait()
-        for q in queues.values():
-            q.put(None)                  # flush each worker
-        for p in procs.values():
-            p.join(timeout=5)
-
-
-def _parse_carriers(spec):
-    """'929.6125,931.2125' (MHz) -> [929612500, 931212500] (Hz)."""
-    out = []
-    for tok in spec.split(","):
-        tok = tok.strip()
-        if not tok:
-            continue
-        out.append(int(round(float(tok) * 1e6)))
-    return out
+    carrier = 0
+    sd = F.FLEXStream(cfg=dict(in_rate=in_rate),
+                      window_frames=RC.WINDOW_FR, advance_frames=RC.ADVANCE_FR,
+                      on_page=RC.make_flex_on_page(carrier, lf))
+    x = np.fromfile(cfile, dtype=np.complex64)
+    chunk = int(2.0 * in_rate)
+    for i in range(0, len(x), chunk):
+        sd.feed(x[i:i + chunk])
+    sd.flush()
+    print(f"flex_receiver file: {len(sd.pages)} trustworthy A/B pages "
+          f"({len(x)/in_rate:.1f}s @ {in_rate/1e3:.0f}k)", file=sys.stderr)
+    return len(sd.pages)
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description="Single-carrier live FLEX receiver. For multi-carrier or mixed "
+                    "FLEX/POCSAG, use start_receiver.py.")
     ap.add_argument("--file")
     ap.add_argument("--in-rate", type=float, default=float(F.SAMP))
     ap.add_argument("--live", action="store_true")
-    ap.add_argument("--carriers",
-                    help="comma-separated FLEX carrier frequencies in MHz for "
-                         "--live, e.g. 929.6125,929.9375,931.2125")
-    ap.add_argument("--center", type=float,
-                    help="SDR tuner center frequency in MHz; defaults to the "
-                         "midpoint of --carriers")
+    ap.add_argument("--freq", type=float,
+                    help="FLEX carrier frequency in MHz (required for --live)")
     ap.add_argument("--driver", default="sdrplay",
                     help="SoapySDR driver for --live (sdrplay|rtlsdr|airspy)")
-    ap.add_argument("--log", help=f"log directory for --live (default {LOG_DIR})")
+    ap.add_argument("--log", help=f"log directory for --live (default {RC.LOG_DIR})")
     args = ap.parse_args()
     if args.file:
         run_file(args.file, args.in_rate)
     elif args.live:
-        if not args.carriers:
-            ap.error("--live requires --carriers (comma-separated MHz)")
-        carriers = _parse_carriers(args.carriers)
-        if not carriers:
-            ap.error("--carriers parsed to an empty list")
-        center = (int(round(args.center * 1e6)) if args.center is not None
-                  else (min(carriers) + max(carriers)) // 2)
-        half = SAMP_RATE // 2
-        out_of_band = [c for c in carriers if abs(c - center) > half]
-        if out_of_band:
-            ap.error(f"carriers outside the {SAMP_RATE/1e6:.1f} MHz capture window "
-                     f"around {center/1e6:.4f} MHz: "
-                     f"{[c/1e6 for c in out_of_band]} MHz")
-        run_live(carriers, center, driver=args.driver, log_dir=args.log or LOG_DIR)
+        if args.freq is None:
+            ap.error("--live requires --freq (carrier frequency in MHz)")
+        freq = int(round(args.freq * 1e6))
+        import receiver_sdr       # GNU Radio; imported only for the live path
+        receiver_sdr.run_live([freq], [], freq, driver=args.driver,
+                              log_dir=args.log or RC.LOG_DIR)
     else:
         ap.error("specify --file CFILE or --live")
 

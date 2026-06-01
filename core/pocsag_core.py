@@ -434,7 +434,7 @@ def decode_baseband(x, in_rate=IN_RATE_DEFAULT, on_page=None):
 class POCSAGStream:
     """Feed complex baseband (one carrier @ in_rate, default 250k) in arbitrary
     chunks; emits alpha pages once each via on_page(addr, func, text) or read
-    self.pages after flush(). Sibling of the FLEX StreamDecoder (in flex_core.py).
+    self.pages after flush(). Sibling of the FLEX FLEXStream (in flex_core.py).
 
     Unlike FLEX (frame-periodic on a shared clock) POCSAG has no global slot, so
     we slide an overlapped window over the buffer and re-run the validated batch

@@ -25,12 +25,12 @@ import flex_core as F
 import receiver_core as RC
 
 
-def run_file(cfile, in_rate, log_path=None):
+def run_file(cfile, in_rate, log_path=None, inv=False):
     """Replay a capture through FLEXStream exactly as the live path would, then
     report the trustworthy A/B page count (parity check vs flex_batch)."""
     lf = open(log_path, "a", buffering=1) if log_path else None
     carrier = 0
-    sd = F.FLEXStream(cfg=dict(in_rate=in_rate),
+    sd = F.FLEXStream(cfg=dict(in_rate=in_rate, inv=inv),
                       window_frames=RC.WINDOW_FR, advance_frames=RC.ADVANCE_FR,
                       on_page=RC.make_flex_on_page(carrier, lf))
     x = np.fromfile(cfile, dtype=np.complex64)
@@ -54,17 +54,19 @@ def main():
                     help="FLEX carrier frequency in MHz (required for --live)")
     ap.add_argument("--driver", default="sdrplay",
                     help="SoapySDR driver for --live (sdrplay|rtlsdr|airspy)")
+    ap.add_argument("--inv", action="store_true",
+                    help="invert tone->level polarity (spectrally-mirrored capture)")
     ap.add_argument("--log", help=f"log directory for --live (default {RC.LOG_DIR})")
     args = ap.parse_args()
     if args.file:
-        run_file(args.file, args.in_rate)
+        run_file(args.file, args.in_rate, inv=args.inv)
     elif args.live:
         if args.freq is None:
             ap.error("--live requires --freq (carrier frequency in MHz)")
         freq = int(round(args.freq * 1e6))
         import receiver_sdr       # GNU Radio; imported only for the live path
         receiver_sdr.run_live([freq], [], freq, driver=args.driver,
-                              log_dir=args.log or RC.LOG_DIR)
+                              log_dir=args.log or RC.LOG_DIR, inv=args.inv)
     else:
         ap.error("specify --file CFILE or --live")
 

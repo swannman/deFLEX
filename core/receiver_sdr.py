@@ -90,9 +90,10 @@ def build_channelizer(carrier_queues, center, samp_rate, driver):
 
 
 def run_live(flex_carriers, pocsag_carriers, center, samp_rate=RC.SAMP_RATE,
-             driver="sdrplay", log_dir=RC.LOG_DIR):
+             driver="sdrplay", log_dir=RC.LOG_DIR, inv=False):
     """Tune one SDR to `center`, channelize, and spawn one worker process per
-    (carrier, protocol). Blocks until KeyboardInterrupt."""
+    (carrier, protocol). Blocks until KeyboardInterrupt. `inv` flips FLEX tone
+    polarity for a spectrally-mirrored capture (POCSAG auto-detects polarity)."""
     a = RC.assign(flex_carriers, pocsag_carriers)
     oob = RC.check_in_band(list(a), center, samp_rate)
     if oob:
@@ -108,10 +109,12 @@ def run_live(flex_carriers, pocsag_carriers, center, samp_rate=RC.SAMP_RATE,
         for proto in protos:
             q = mp.Queue(maxsize=RC.QUEUE_MAXCHUNKS)
             pv = mp.Value('i', 0)
-            target = RC.flex_worker if proto == "flex" else RC.pocsag_worker
-            suffix = "flexdec" if proto == "flex" else "pocsag"
+            if proto == "flex":
+                target, suffix, extra = RC.flex_worker, "flexdec", (inv,)
+            else:
+                target, suffix, extra = RC.pocsag_worker, "pocsag", ()
             p = mp.Process(target=target,
-                           args=(carrier, q, f"{log_dir}/{carrier}.{suffix}.log", pv),
+                           args=(carrier, q, f"{log_dir}/{carrier}.{suffix}.log", pv) + extra,
                            daemon=True)
             p.start()
             procs.append(p)

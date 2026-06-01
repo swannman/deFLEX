@@ -45,15 +45,12 @@ def main():
                     help="emit every page type (NUM/NNM too) and skip the english_score gate")
     ap.add_argument("--carrier", type=float, default=0.0,
                     help="channel-select offset in Hz within the +-fs/2 capture band")
-    ap.add_argument("--lpf", type=float, default=12000.0,
-                    help="channel low-pass cutoff in Hz (default 12000)")
     ap.add_argument("--inv", action="store_true",
-                    help="invert the tone->level polarity map")
+                    help="invert the tone->level polarity map (spectrally-mirrored capture)")
     args = ap.parse_args()
 
     cfile = args.cfile
     in_rate = args.in_rate         # None -> front_end assumes SAMP=250k
-    lpf = args.lpf
     carrier = args.carrier         # channel-select offset (Hz) within the +-fs/2 band
     inv = args.inv                 # reverse tone->level map (polarity)
     # --carrier shifts a neighbouring FLEX channel down to baseband (load_baseband
@@ -62,7 +59,7 @@ def main():
     # within the +-125 kHz of the SAME capture IQ -- a true multi-carrier decode
     # with no new capture. The sync state machine auto-detects the channel's mode.
     demod, xb = front_end(cfile, cfo=carrier, mflen=SPB,
-                          lpf=lpf, return_baseband=True, in_rate=in_rate)
+                          lpf=12000.0, return_baseband=True, in_rate=in_rate)
     demod = demod - np.median(demod)            # global DC/CFO removal
     corr_off = 1517.0                           # peak->frame-start offset for corr_frames
     alpha_only = not args.all                   # optimize for ALN/SPN: drop NUM/NNM (--all keeps every type)

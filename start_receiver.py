@@ -53,6 +53,9 @@ def main():
                     help=f"SDR capture sample rate in Hz (default {R.SAMP_RATE})")
     ap.add_argument("--driver", default="sdrplay",
                     help="SoapySDR driver (sdrplay|rtlsdr|airspy)")
+    ap.add_argument("--inv", action="store_true",
+                    help="invert FLEX tone polarity for a spectrally-mirrored capture "
+                         "(POCSAG auto-detects polarity, so this only affects FLEX)")
     ap.add_argument("--log", help=f"log directory (default {R.LOG_DIR})")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the channelization plan and exit (no SDR access)")
@@ -71,7 +74,8 @@ def main():
         return
     import receiver_sdr           # GNU Radio; imported only for the live path
     receiver_sdr.run_live(flex, pocsag, center, samp_rate=args.samp_rate,
-                          driver=args.driver, log_dir=args.log or R.LOG_DIR)
+                          driver=args.driver, log_dir=args.log or R.LOG_DIR,
+                          inv=args.inv)
 
 
 if __name__ == "__main__":

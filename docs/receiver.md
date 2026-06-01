@@ -136,6 +136,10 @@ python3 flex_receiver.py   --file capture.cfile --in-rate 250000
 python3 pocsag_receiver.py --file capture.cfile --in-rate 250000
 ```
 
+For a spectrally-mirrored capture, pass `--inv` (to `flex_receiver`,
+`start_receiver`, or `flex_batch`) to flip FLEX tone polarity. POCSAG auto-detects
+polarity, so it needs no such flag and ignores `--inv`.
+
 The scripts put `core/` and their own directory on `sys.path`, so they run from a
 repo checkout **and** from a flat install where everything is co-located. The
 `--file` paths use only numpy/scipy; `--live` and the harness need GNU Radio.

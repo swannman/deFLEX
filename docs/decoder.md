@@ -229,9 +229,8 @@ Run `flex_batch.py --help` for the complete list.
 |---|---|
 | `--all` | Emit every page type (NUM/NNM too) and skip the `english_score` gate. |
 | `--carrier HZ` | De-rotate to a channel at this offset before decoding. |
-| `--lpf HZ` | Channel low-pass cutoff (default 12000). |
 | `--in-rate HZ` | Capture sample rate in Hz (default 250000). |
-| `--inv` | Invert the tone→level polarity map. |
+| `--inv` | Invert the tone→level polarity map (spectrally-mirrored capture). |
 
 Output: per-frame stats, the A/B/C/D confidence summary, a by-type/tier breakdown,
 and sample message bodies tagged `[tier margin printable% english]`.

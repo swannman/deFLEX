@@ -97,9 +97,9 @@ def _pump(q, decoder, pages_val):
             return
 
 
-def flex_worker(carrier, q, log_path, pages_val=None):
+def flex_worker(carrier, q, log_path, pages_val=None, inv=False):
     lf = open(log_path, "a", buffering=1) if log_path else None
-    sd = F.FLEXStream(cfg=dict(in_rate=CHAN_RATE),
+    sd = F.FLEXStream(cfg=dict(in_rate=CHAN_RATE, inv=inv),
                       window_frames=WINDOW_FR, advance_frames=ADVANCE_FR,
                       on_page=make_flex_on_page(carrier, lf))
     _pump(q, sd, pages_val)

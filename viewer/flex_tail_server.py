@@ -95,7 +95,7 @@ def parse_line(line: str):
         body = "|".join(p[6:]) if len(p) > 6 else ""
     else:
         return None
-    body = body.strip()
+    body = body.replace("\\n", " ").strip()   # escaped newlines -> space, then trim
     if not body:
         return None
     return {"ts": ts, "capcode": capcode, "flag": flag, "body": body}

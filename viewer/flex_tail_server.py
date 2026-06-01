@@ -95,10 +95,10 @@ def parse_line(line: str):
         body = "|".join(p[6:]) if len(p) > 6 else ""
     else:
         return None
-    # escaped control chars -> space, then trim the ends (keep interior padding,
-    # which is meaningful column alignment in many pages)
-    body = (body.replace("\\n", " ").replace("\\r", " ")
-                .replace("\\t", " ").strip())
+    # escaped control chars -> space, then collapse whitespace runs to one space
+    # and trim the ends, so multi-line / padded pages render as one clean line
+    body = body.replace("\\n", " ").replace("\\r", " ").replace("\\t", " ")
+    body = " ".join(body.split())
     if not body:
         return None
     return {"ts": ts, "capcode": capcode, "flag": flag, "body": body}

@@ -45,12 +45,13 @@ The **executables** live at the root; the importable **libraries** live in
 multi-carrier, multi-protocol harness.
 
 ```
-start_receiver.py   multi-channel receiver: one SDR -> channelize -> a decoder per carrier
-                    (--flex / --pocsag lists; a shared freq gets both)
 flex_receiver.py    single-carrier live FLEX receiver (+ --file replay)
 pocsag_receiver.py  single-carrier live POCSAG receiver (+ --file replay)
 flex_batch.py       FLEX batch decoder (CLI) over a recorded .cfile
 pocsag_batch.py     POCSAG batch decoder (CLI)
+
+start_receiver.py   multi-channel receiver: one SDR -> channelize -> a decoder per carrier
+                    (--flex / --pocsag lists; a shared freq gets both)
 
 core/               importable library modules
   paging_core.py      shared core: BCH(31,21) + Chase soft-decode + english_score gate

@@ -26,14 +26,14 @@ that multimon renders as noise.
 ## How it compares to `multimon-ng`
 
 On matched benchmarks (identical readability gate, deduplicated), deFLEX's
-real-message recall is comparable, but its **fidelity is categorically better**:
+real-message recall is comparable, but its fidelity is improved:
 multimon prints whatever it sliced — bit errors, base64 blobs, and several
 error-different copies of the same page — while deFLEX emits each message once,
-clean, or not at all. On weak / off-center carriers deFLEX **clearly wins**,
+clean, or not at all. On weak / off-center carriers deFLEX demonstrates improvements,
 recovering pages multimon dissolves into noise. The full comparison is in
 [`docs/decoder.md`](docs/decoder.md).
 
-deFLEX is **not** `multimon-ng`-derived: it was built from the TIA-1500 protocol
+deFLEX is not `multimon-ng`-derived: it was built from the TIA-1500 protocol
 tables, using `gr-pager` only as a protocol reference (not linked).
 
 ## Layout

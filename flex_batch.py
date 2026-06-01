@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """FLEX batch decoder (CLI).
 
-Runs the FLEX decoder (flex_core) over a recorded .cfile capture and grades every
-page by confidence tier (A=verified, B=FEC-corrected, C=suspect, D=failed) from
-how hard the FEC worked and whether the body reads as English. The offline entry
-point; the live receiver imports flex_core directly. See docs/decoder.md for the
-flags and the algorithm.
+Thin wrapper over flex_core.decode_baseband(): runs the FLEX decoder over a
+recorded .cfile capture and grades every page by confidence tier (A=verified,
+B=FEC-corrected, C=suspect, D=failed). The offline counterpart to the live
+receiver, which imports flex_core directly. See docs/decoder.md for the algorithm.
 
 The full-strength decode chain is always on: 4-FSK matched-filter bank, correlator
 acquisition, comb-synthesized frames, timing/parity sweep, and Chase-II soft FEC.
 By default only alpha pages (ALN/SPN) are kept and graded; pass --all to emit every
 page type without the English-readability gate.
 
-Run `flex_batch.py --help` for the full flag list. Typical use:
-    flex_batch.py capture.cfile [--in-rate HZ] [--carrier HZ] [--all]
+Each trustworthy (A/B) page prints one per line on stdout; the FEC/tier report goes
+to stderr (so `flex_batch.py … | grep` sees just the pages, like pocsag_batch).
+
+Usage: flex_batch.py <cfile> [--in-rate HZ] [--carrier HZ] [--all] [--inv]
 """
 import os
 import sys
@@ -23,21 +24,17 @@ import numpy as np
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)                                    # flat-install fallback
 sys.path.insert(0, os.path.join(_HERE, "core"))
-from flex_core import *          # noqa: F401,F403 -- decode functions + constants
+from flex_core import decode_baseband
 
-# The offline entry point: read a capture, run the full decode chain (matched-filter
-# bank + correlator acquisition + comb + sweep + Chase soft FEC), and grade every
-# page A/B/C/D by how hard the FEC worked and whether its body reads as English. It
-# never hard-drops a page -- it labels confidence and lets the caller choose. The
-# live receivers import the same building blocks from flex_core directly.
+
 def main():
     import argparse
     ap = argparse.ArgumentParser(
         description="FLEX batch decoder: decode a recorded .cfile capture and grade "
-                    "every page by confidence tier (A=verified, B=FEC-corrected, "
-                    "C=suspect, D=failed). The full-strength decode chain is always on; "
-                    "by default only alpha (ALN/SPN) pages are kept and graded against "
-                    "the english_score readability gate.")
+                    "every page by confidence tier (A/B/C/D). The full-strength chain "
+                    "is always on; by default only alpha (ALN/SPN) pages are kept and "
+                    "graded against the english_score gate. Trustworthy (A/B) pages "
+                    "print to stdout; the tier/FEC report goes to stderr.")
     ap.add_argument("cfile", help="raw complex64 IQ capture")
     ap.add_argument("--in-rate", type=float, default=None,
                     help="capture sample rate in Hz (default: 250000 = decoder SAMP)")
@@ -49,150 +46,34 @@ def main():
                     help="invert the tone->level polarity map (spectrally-mirrored capture)")
     args = ap.parse_args()
 
-    cfile = args.cfile
-    in_rate = args.in_rate         # None -> front_end assumes SAMP=250k
-    carrier = args.carrier         # channel-select offset (Hz) within the +-fs/2 band
-    inv = args.inv                 # reverse tone->level map (polarity)
-    # --carrier shifts a neighbouring FLEX channel down to baseband (load_baseband
-    # de-rotates by `carrier` Hz; the existing LPF then isolates it, pushing the
-    # original centre carrier out of band). Lets us decode every channel that falls
-    # within the +-125 kHz of the SAME capture IQ -- a true multi-carrier decode
-    # with no new capture. The sync state machine auto-detects the channel's mode.
-    demod, xb = front_end(cfile, cfo=carrier, mflen=SPB,
-                          lpf=12000.0, return_baseband=True, in_rate=in_rate)
-    demod = demod - np.median(demod)            # global DC/CFO removal
-    corr_off = 1517.0                           # peak->frame-start offset for corr_frames
-    alpha_only = not args.all                   # optimize for ALN/SPN: drop NUM/NNM (--all keeps every type)
-    # alpha-only lets us comb aggressively: garbage numeric pages (which always
-    # look 'printable') would otherwise flood the tiers, but we discard them, and
-    # garbage alpha is self-evidently non-English (caught by the printable gate).
-    corr_thr = -1.0 if alpha_only else 0.35
-    frames = corr_frames(demod, p0_offset=corr_off, grid=True,
-                         include_thr=corr_thr)
-    n_anchor = len(frames)
-    frames = add_comb_frames(frames, len(demod), verbose=False)
+    cfg = dict(carrier=args.carrier, inv=args.inv, alpha_only=not args.all,
+               sweep_half=None)        # None -> full timing sweep (the batch default)
+    if args.in_rate is not None:
+        cfg["in_rate"] = args.in_rate
+    x = np.fromfile(args.cfile, dtype=np.complex64)
+    pages, st = decode_baseband(x, cfg)
 
-    def decode_mf(pos16, baud, levels, chase=False):
-        # Tier 1/2 path: 4-FSK matched-filter bank on the complex baseband at the
-        # given symbol centers (16 kHz units), with per-frame carrier null (Tier 2).
-        cfo = est_cfo(xb, pos16[0] * SAMP / FS, pos16[-1] * SAMP / FS)
-        metric = mf_bank_mag(xb, pos16, baud, cfo=cfo, inv=inv)
-        bit_a, bit_b, mag_a, mag_b = mfbank_softbits(metric)
-        phases, mags = demux_phases(bit_a, bit_b, mag_a, mag_b, baud)
-        return decode_phases(phases, mags, chase=chase)
+    fe = "mfbank+cfo" + ("+inv" if args.inv else "")
+    ctxt = f" carrier offset {args.carrier/1e3:+.0f} kHz" if args.carrier else ""
+    t = st["tiers"]
+    print(f"=== front-end={fe}/corr-grid soft=True comb=True{ctxt} ===\n"
+          f"frames        : {st['n_frames']} (anchors synced={st['n_anchor']}, "
+          f"comb-synth={st['n_frames']-st['n_anchor']})\n"
+          f"BCH corrected : {st['bch_corr']}   Chase-recovered: {st['bch_chase']}   "
+          f"BCH FAILED: {st['bch_fail']}\n"
+          f"[sweep] (offset,parity) histogram: {dict(sorted(st['off_hist'].items()))}\n"
+          f"pages emitted : {st['raw_pages']}  (empty={st['empty']}, "
+          f"nonempty={sum(t.values())})\n"
+          f"confidence    : A_verified={t['A']}  B_fec={t['B']}  C_suspect={t['C']}  "
+          f"D_failed={t['D']}   (trustworthy A+B={t['A']+t['B']})\n"
+          f"by type/tier  : A={st['by_tier_type']['A']} B={st['by_tier_type']['B']} "
+          f"C={st['by_tier_type']['C']} D={st['by_tier_type']['D']}", file=sys.stderr)
 
-    sweep = True
-    soft = True                          # Chase-II soft-decision FEC on hard fails
-    pages = []
-    bch_fail = bch_corr = bch_chase = 0
-    off_hist = {}
-    for f in frames:
-        spb = f["spb"]; p0 = f["p0"]; nsyms = f["nsyms"]
-        if not sweep:
-            offs = [0.0]
-        else:
-            offs = [float(o) for o in range(-(spb // 2), spb - spb // 2)]
-        # symbol-parity search: 3200-baud A/C de-mux can land on the wrong
-        # symbol parity (whole frame fails). Try starting on symbol 0 or 1.
-        pars = [0, 1] if f["baud"] == 3200 else [0]
-        best = None
-        # sweep uses fast HARD decode to pick timing/parity; soft Chase is run
-        # once on the winner (it only helps words, never changes which sync is best)
-        for par in pars:
-            for off in offs:
-                base = p0 + off + par * spb
-                n = nsyms - par
-                pos = base + np.arange(n) * spb
-                if pos[0] < 0 or pos[-1] >= len(demod) - 1:
-                    continue
-                wordsets, confsets, nf, nc, _ = decode_mf(pos, f["baud"], f["levels"])
-                if best is None or nf < best[1]:
-                    best = (off, nf, nc, wordsets, confsets, par, pos)
-        if best is None:
-            continue
-        off, nf, nc, wordsets, confsets, par, bpos = best
-        # Sweep above used the fast hard decode to pick timing/parity. Refine the
-        # winner once with Chase soft-decision FEC.
-        wordsets, confsets, nf, nc, nch = decode_mf(
-            bpos, f["baud"], f["levels"], chase=soft)
-        bch_chase += nch
-        key = (round(off, 1), par)
-        off_hist[key] = off_hist.get(key, 0) + 1
-        bch_fail += nf; bch_corr += nc
-        for words, cf in zip(wordsets, confsets):
-            if words is not None:
-                pages.extend(parse_frame(words, cf))
-    if sweep:
-        print(f"[sweep] chosen (offset,parity) histogram: {dict(sorted(off_hist.items()))}",
-              file=sys.stderr)
+    for cap, typ, body, tier, pr, en in pages:
+        if tier in ("A", "B"):
+            entxt = f" en={en:.2f}" if not args.all else ""
+            print(f"cap={cap:>9} {typ} {tier}{entxt}  {body.decode('ascii', 'replace')!r}")
 
-    # confidence-graded classification (NO hard BCH gate): emit every page, score it.
-    # Tier A verified : all words clean syndrome (status 0) AND min-margin healthy.
-    # Tier B fec      : BCH-corrected or Chase-recovered words, no uncorrectable word.
-    # Tier C suspect  : passed BCH but min-margin < 0.5x local median (likely miscorrect),
-    #                   or no soft info available.
-    # Tier D failed   : >=1 uncorrectable word in the page (corrupted body).
-    MARGIN_OK = 0.5
-    ALPHA_EN_OK = 0.60   # english_score floor for a trustworthy --alpha page
-    empty = 0
-    tiers = {"A": 0, "B": 0, "C": 0, "D": 0}
-    by_tier_type = {"A": {}, "B": {}, "C": {}, "D": {}}
-    trustworthy = []                       # A/B pages, printed one per line to stdout
-
-    def tier_of(pc, pr, en):
-        # RF/FEC confidence first, then a body-text sanity check: a page the RF
-        # layer is sure of but whose body isn't mostly printable is NOT a
-        # trustworthy *message* (binary/junk or a likely miscorrection), so it
-        # can't sit in A/B regardless of margin.
-        if pc is None:
-            t = "C"
-        elif pc["failed"] > 0:
-            t = "D"
-        elif pc["margin"] == pc["margin"] and pc["margin"] < MARGIN_OK:
-            t = "C"
-        elif pc["corrected"] or pc["chase"]:
-            t = "B"
-        else:
-            t = "A"
-        if t in ("A", "B") and pr < 0.85:
-            t = "C"
-        # --alpha: the comb is aggressive, so demand the body actually reads as
-        # English. This rejects Chase-manufactured garbage that slips past the
-        # printable gate, and conversely lets a genuinely-English-but-garbled
-        # message keep its FEC tier.
-        if alpha_only and en < ALPHA_EN_OK and t in ("A", "B"):
-            t = "C"
-        return t
-
-    for cap, typ, body, pc in pages:
-        if alpha_only and typ not in ("ALN", "SPN"):   # keep only alpha pages
-            continue
-        if len(body) == 0:
-            empty += 1; continue
-        pr = sum(1 for c in body if 32 <= c < 127) / len(body)
-        en = english_score(body) if alpha_only else 1.0
-        t = tier_of(pc, pr, en)
-        tiers[t] += 1
-        by_tier_type[t][typ] = by_tier_type[t].get(typ, 0) + 1
-        if t in ("A", "B"):
-            trustworthy.append((cap, typ, t, en, body.decode("ascii", "replace")))
-
-    # Stats to stderr (FLEX-specific FEC/tier report); decoded pages to stdout, one
-    # per line, so `flex_batch ... | grep` sees just the pages (like pocsag_batch).
-    fe = "mfbank+cfo" + ("+inv" if inv else "")
-    ctxt = f" carrier offset {carrier/1e3:+.0f} kHz" if carrier else ""
-    nonempty = sum(tiers.values())
-    print(f"=== front-end={fe}/corr-grid soft={soft} comb=True{ctxt} ===\n"
-          f"frames        : {len(frames)} (anchors synced={n_anchor}, comb-synth={len(frames)-n_anchor})\n"
-          f"BCH corrected : {bch_corr}   Chase-recovered: {bch_chase}   BCH FAILED: {bch_fail}\n"
-          f"pages emitted : {len(pages)}  (empty={empty}, nonempty={nonempty})\n"
-          f"confidence    : A_verified={tiers['A']}  B_fec={tiers['B']}  "
-          f"C_suspect={tiers['C']}  D_failed={tiers['D']}   (trustworthy A+B={tiers['A']+tiers['B']})\n"
-          f"by type/tier  : A={by_tier_type['A']} B={by_tier_type['B']} "
-          f"C={by_tier_type['C']} D={by_tier_type['D']}", file=sys.stderr)
-    for cap, typ, t, en, s in trustworthy:
-        entxt = f" en={en:.2f}" if alpha_only else ""
-        print(f"cap={cap:>9} {typ} {t}{entxt}  {s!r}")
 
 if __name__ == "__main__":
     main()

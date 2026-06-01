@@ -168,8 +168,11 @@ def load_baseband(cfile, cfo=0.0, lpf=12000.0, in_rate=None):
     then polyphase-decimated down to SAMP -- so the rest of the (validated)
     pipeline runs at exactly 250k regardless of capture bandwidth. This is how a
     2.646 MS/s 7-carrier wideband file is decoded one carrier at a time:
-    --carrier is the offset (Hz) of the wanted channel from the file's center."""
-    x = np.fromfile(cfile, dtype=np.complex64)
+    --carrier is the offset (Hz) of the wanted channel from the file's center.
+
+    `cfile` may be a path (read as complex64) or an already-loaded IQ array."""
+    x = (np.fromfile(cfile, dtype=np.complex64) if isinstance(cfile, str)
+         else np.asarray(cfile, dtype=np.complex64))
     if in_rate is None:
         in_rate = SAMP
     if cfo:
@@ -191,13 +194,6 @@ def demod_from_baseband(xb, mf=True, mflen=SPB):
         # match the actual symbol length in 16 kHz samples (5 for 3200 baud,
         # 10 for 1600); a too-long boxcar averages across symbols and destroys data.
         d16 = np.convolve(d16, np.ones(mflen) / mflen, mode="same")
-    return d16
-
-def front_end(cfile, cfo=0.0, mf=True, mflen=SPB, lpf=12000.0, return_baseband=False, in_rate=None):
-    xb = load_baseband(cfile, cfo, lpf, in_rate=in_rate)
-    d16 = demod_from_baseband(xb, mf, mflen)
-    if return_baseband:
-        return d16, xb
     return d16
 
 # ---- Tier 1/2: 4-FSK matched-filter bank + carrier null -------------------
@@ -929,7 +925,9 @@ DEFAULT_CFG = dict(
 
 
 def _classify(typ, body, pc, cfg):
-    """Replica of flex_batch.main()'s tier_of + the pr/en computation around it."""
+    """Grade one page into a confidence tier (A/B/C/D), returning (tier, printable
+    ratio, english score). Used by decode_baseband and the live StreamDecoder so
+    both score pages identically."""
     pr = sum(1 for c in body if 32 <= c < 127) / len(body)
     en = english_score(body) if cfg["alpha_only"] else 1.0
     if pc is None:
@@ -950,52 +948,39 @@ def _classify(typ, body, pc, cfg):
 
 
 # ---------------------------------------------------------------------------
-# THE PER-WINDOW DECODE
+# THE FRAME-DECODE LOOP (shared by batch and streaming)
 # ---------------------------------------------------------------------------
-# decode_window is the bridge: it takes one window of complex samples and runs
-# deFLEX's offline frame loop on it. The body is deliberately a near-verbatim
-# copy of flex_batch.main()'s loop (same acquisition, sweep, MF bank, Chase)
-# so the streamed and offline paths can never silently diverge. The ONE addition
-# is computing each frame's absolute `slot` from the window offset s0 -- that
-# global slot number is what makes cross-window de-duplication exact.
-def decode_window(xb, s0, cfg):
-    """Decode one complex-baseband window. `s0` = absolute index (250k samples)
-    of xb[0] in the stream, used to assign each frame its global slot number.
-    Returns list of (slot, typ, body_bytes, pc). This is flex_batch.main()'s frame
-    loop (lines ~998-1055) lifted verbatim, parameterized by cfg/xb/demod.
-
-    `xb` is the channel-selected complex baseband (post freq-xlate). If its rate
-    `cfg["in_rate"]` differs from the internal SAMP (250k) -- e.g. a live tap at
-    22050 Hz -- we polyphase-resample the window to 250k first, exactly as
-    load_baseband() does, then apply the same 127-tap channel LPF, so the
-    matched-filter bank and FM demod see identical samples to a batch run. The
-    resample+filter run per-window; their edge transient is far shorter than a
-    frame, and window overlap keeps every frame away from an edge in at least one
-    window. `s0` is in INPUT-rate samples (mapped to the 16k grid for slots)."""
-    in_rate = cfg["in_rate"]
-    if in_rate != SAMP:
-        from math import gcd
-        g = gcd(int(round(in_rate)), SAMP)
-        xb = signal.resample_poly(xb, SAMP // g, int(round(in_rate)) // g)
-    taps = signal.firwin(127, cfg["lpf"] / (SAMP / 2))
-    xb = signal.lfilter(taps, 1.0, xb)
-    demod = demod_from_baseband(xb, mf=False, mflen=cfg["mflen"])
-    demod = demod - np.median(demod)                 # global DC/CFO removal
+# _decode_frames is the single copy of the FLEX decode loop: acquire frames
+# (matched-filter sync correlator + periodic-grid comb), then for each frame
+# sweep symbol timing/parity, decode with the 4-FSK MF bank, and refine the
+# winner once with Chase soft FEC. Both entry points build on it:
+#   decode_baseband  -- whole capture, returns graded pages   (flex_batch.py)
+#   decode_window    -- one streaming window, returns raw pages with slot numbers
+# The callers own the front end (demod), so they keep their differences: batch
+# uses the matched-filter acquisition demod and a full timing sweep; streaming
+# uses a plain demod and a bounded ±sweep_half sweep.
+def _decode_frames(demod, xb, cfg, s0=0):
+    """Acquire + sweep-decode every frame in one demod block. Returns
+    (pages, stats); pages = [(slot, cap, typ, body, pc)] with slot the absolute
+    16 kHz frame slot derived from s0 (0 for a whole-capture decode)."""
     corr_thr = -1.0 if cfg["alpha_only"] else 0.35
     frames = corr_frames(demod, p0_offset=cfg["corr_off"], grid=True,
-                           include_thr=corr_thr)
+                         include_thr=corr_thr)
+    n_anchor = len(frames)
     if cfg["comb"]:
         frames = add_comb_frames(frames, len(demod), verbose=False)
 
     def decode_mf(pos16, baud, levels, chase=False):
-        cfo = 0.0 if cfg["nocfo"] else est_cfo(
+        cfo = 0.0 if cfg.get("nocfo") else est_cfo(
             xb, pos16[0] * SAMP / FS, pos16[-1] * SAMP / FS)
         metric = mf_bank_mag(xb, pos16, baud, cfo=cfo, inv=cfg["inv"])
         bit_a, bit_b, mag_a, mag_b = mfbank_softbits(metric)
         phases, mags = demux_phases(bit_a, bit_b, mag_a, mag_b, baud)
         return decode_phases(phases, mags, chase=chase)
 
-    results = []
+    pages = []
+    bch_fail = bch_corr = bch_chase = 0
+    off_hist = {}
     for f in frames:
         spb = f["spb"]; p0 = f["p0"]; nsyms = f["nsyms"]
         if not cfg["sweep"]:
@@ -1003,9 +988,8 @@ def decode_window(xb, s0, cfg):
         else:
             # Timing-phase search around the sync-locked grid. mf_bank_mag is the
             # bulk of decode CPU and the sweep multiplies it by len(offs)*len(pars)
-            # per frame; sweep_half bounds the integer offset window. A narrow ±1
-            # (3 offsets) window decodes essentially as well as the full ±spb//2
-            # while cutting mf_bank_mag calls by ~a third. None = full width.
+            # per frame; sweep_half bounds the integer offset window (None = full
+            # ±spb//2, which the batch path uses; streaming uses a narrow ±1).
             _h = cfg.get("sweep_half")
             if _h is not None:
                 offs = [float(o) for o in range(-_h, _h + 1)]
@@ -1028,13 +1012,68 @@ def decode_window(xb, s0, cfg):
         off, nf, nc, wordsets, confsets, par, bpos = best
         wordsets, confsets, nf, nc, nch = decode_mf(
             bpos, f["baud"], f["levels"], chase=cfg["soft"])
+        bch_chase += nch
+        bch_fail += nf; bch_corr += nc
+        off_hist[(round(off, 1), par)] = off_hist.get((round(off, 1), par), 0) + 1
         abs16 = s0 * FS / cfg["in_rate"] + p0  # this frame's absolute 16k position
         slot = int(round(abs16 / FRAME_PERIOD))
         for words, cf in zip(wordsets, confsets):
             if words is not None:
                 for cap, typ, body, pc in parse_frame(words, cf):
-                    results.append((slot, typ, body, pc))
-    return results
+                    pages.append((slot, cap, typ, body, pc))
+    stats = dict(n_anchor=n_anchor, n_frames=len(frames), bch_corr=bch_corr,
+                 bch_chase=bch_chase, bch_fail=bch_fail, off_hist=off_hist)
+    return pages, stats
+
+
+def decode_baseband(x, cfg=None):
+    """Whole-capture FLEX decode: a complex64 IQ array -> graded alpha pages.
+    The offline counterpart to POCSAG's decode_baseband; flex_batch.py is a thin
+    wrapper around it. Returns (pages, stats) where pages = [(cap, typ, body,
+    tier, pr, en)] for every non-empty (alpha, unless cfg['alpha_only'] is False)
+    page across all tiers -- the trustworthy set is tier in {A, B}. `cfg` overrides
+    DEFAULT_CFG; batch sets carrier (channel offset Hz) and sweep_half=None (full
+    sweep)."""
+    cfg = dict(DEFAULT_CFG, **(cfg or {}))
+    xb = load_baseband(x, cfo=cfg.get("carrier", 0.0), lpf=cfg["lpf"],
+                       in_rate=cfg["in_rate"])
+    demod = demod_from_baseband(xb, mf=cfg.get("mf", True), mflen=cfg["mflen"])
+    demod = demod - np.median(demod)                 # global DC/CFO removal
+    raw, stats = _decode_frames(demod, xb, cfg, s0=0)
+    pages = []
+    empty = 0
+    tiers = {"A": 0, "B": 0, "C": 0, "D": 0}
+    by_tier_type = {"A": {}, "B": {}, "C": {}, "D": {}}
+    for slot, cap, typ, body, pc in raw:
+        if cfg["alpha_only"] and typ not in ("ALN", "SPN"):
+            continue
+        if len(body) == 0:
+            empty += 1; continue
+        t, pr, en = _classify(typ, body, pc, cfg)
+        tiers[t] += 1
+        by_tier_type[t][typ] = by_tier_type[t].get(typ, 0) + 1
+        pages.append((cap, typ, body, t, pr, en))
+    stats.update(raw_pages=len(raw), empty=empty, tiers=tiers,
+                 by_tier_type=by_tier_type)
+    return pages, stats
+
+
+def decode_window(xb, s0, cfg):
+    """Decode one complex-baseband window for the streaming path. `s0` = absolute
+    index (input-rate samples) of xb[0] in the stream, used to assign each frame
+    its global slot number for cross-window de-duplication. Returns list of
+    (slot, typ, body_bytes, pc).
+
+    `xb` is the channel-selected complex baseband (post freq-xlate). load_baseband
+    polyphase-resamples it to SAMP (if cfg['in_rate'] differs) and applies the same
+    127-tap channel LPF, so the MF bank and FM demod see identical samples to a
+    batch run; the per-window edge transient is far shorter than a frame, and
+    window overlap keeps every frame away from an edge in at least one window."""
+    xb = load_baseband(xb, cfo=0.0, lpf=cfg["lpf"], in_rate=cfg["in_rate"])
+    demod = demod_from_baseband(xb, mf=False, mflen=cfg["mflen"])
+    demod = demod - np.median(demod)                 # global DC/CFO removal
+    raw, _ = _decode_frames(demod, xb, cfg, s0=s0)
+    return [(slot, typ, body, pc) for slot, cap, typ, body, pc in raw]
 
 
 # ---------------------------------------------------------------------------

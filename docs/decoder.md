@@ -149,19 +149,19 @@ is kept, and genuinely-English-but-garbled messages are promoted to trustworthy.
 
 On a matched benchmark — the same recorded capture, the same readability gate
 (english-score ≥ 0.60), deduplicated on both sides — deFLEX and multimon achieve
-**comparable real-message recall**, but deFLEX's output is **categorically
-cleaner**: every body it emits is BCH/Chase-validated and garbage-free by
+comparable real-message recall, but deFLEX's output is cleaner: 
+every body it emits is BCH/Chase-validated and garbage-free by
 construction, while multimon prints whatever it sliced, errors and all.
 
 | Carrier | Signal | deFLEX (A/B, FEC-clean) | multimon (same gate) |
 |---|---|---|---|
 | strong, on-center | −16 dB | 24 | 28 |
-| weak, off-center | −27.5 dB | **3** | 2 |
+| weak, off-center | −27.5 dB | 3 | 2 |
 | silent | — | 0 | 0 |
 
 multimon's higher count on the strong carrier is inflated by base64/encrypted
 blobs and several error-different copies of the same page; deFLEX emits each
-message once, clean, or not at all. On the **weak carrier** deFLEX wins outright.
+message once, clean, or not at all. On the weak carrier deFLEX improves over multimon.
 
 The same page from both decoders (illustrative; identifiers are placeholders):
 

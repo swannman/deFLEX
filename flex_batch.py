@@ -47,37 +47,21 @@ def main():
                     help="channel-select offset in Hz within the +-fs/2 capture band")
     ap.add_argument("--lpf", type=float, default=12000.0,
                     help="channel low-pass cutoff in Hz (default 12000)")
-    ap.add_argument("--center", type=float, default=929.6125,
-                    help="display-only capture center in MHz, for labelling carriers")
-    ap.add_argument("--mflen", type=int, default=SPB,
-                    help="matched-filter length in samples (default SPB)")
     ap.add_argument("--inv", action="store_true",
                     help="invert the tone->level polarity map")
-    ap.add_argument("--nocfo", action="store_true",
-                    help="disable the per-frame carrier-offset null (Tier 2)")
-    ap.add_argument("--mf", action="store_true",
-                    help="apply the front-end matched filter in the demod stage")
-    ap.add_argument("--diag", action="store_true",
-                    help="print symbol-histogram / adaptive-threshold diagnostics")
-    ap.add_argument("--pf", action="store_true",
-                    help="print per-frame slicer-merit diagnostics")
     args = ap.parse_args()
 
     cfile = args.cfile
     in_rate = args.in_rate         # None -> front_end assumes SAMP=250k
-    mflen = args.mflen
     lpf = args.lpf
     carrier = args.carrier         # channel-select offset (Hz) within the +-fs/2 band
-    center_mhz = args.center       # display-only, for labelling carriers
-    nocfo = args.nocfo             # disable Tier 2 per-frame carrier null
     inv = args.inv                 # reverse tone->level map (polarity)
-    diag = args.diag
     # --carrier shifts a neighbouring FLEX channel down to baseband (load_baseband
     # de-rotates by `carrier` Hz; the existing LPF then isolates it, pushing the
     # original centre carrier out of band). Lets us decode every channel that falls
     # within the +-125 kHz of the SAME capture IQ -- a true multi-carrier decode
     # with no new capture. The sync state machine auto-detects the channel's mode.
-    demod, xb = front_end(cfile, cfo=carrier, mf=args.mf, mflen=mflen,
+    demod, xb = front_end(cfile, cfo=carrier, mflen=SPB,
                           lpf=lpf, return_baseband=True, in_rate=in_rate)
     demod = demod - np.median(demod)            # global DC/CFO removal
     corr_off = 1517.0                           # peak->frame-start offset for corr_frames
@@ -91,31 +75,10 @@ def main():
     n_anchor = len(frames)
     frames = add_comb_frames(frames, len(demod), verbose=True)
 
-    _syms_list = [f["syms"] for f in frames if f.get("syms") is not None]
-    all_syms = np.concatenate(_syms_list) if _syms_list else np.array([])
-    if diag and len(all_syms):
-        v = all_syms - np.median(all_syms)
-        lo, hi = two_means(np.abs(v))
-        print(f"[diag] frames={len(frames)} datasyms={len(all_syms)}")
-        print(f"[diag] |v| inner~{lo:.3f} outer~{hi:.3f} -> adaptive thr~{(lo+hi)/2:.3f} (fixed=2.0)")
-        for q in (1, 5, 25, 50, 75, 95, 99):
-            print(f"[diag]   pctl {q:2d}: v={np.percentile(v,q):+.3f}")
-        hist, edges = np.histogram(v, bins=40, range=(-6, 6))
-        peak = hist.max()
-        for h, e in zip(hist, edges):
-            bar = "#" * int(60 * h / peak)
-            print(f"[hist] {e:+5.1f} | {bar}")
-
-    xp = np.arange(len(demod), dtype=float)
-
-    def sample_at(positions):
-        return np.interp(positions, xp, demod)
-
     def decode_mf(pos16, baud, levels, chase=False):
         # Tier 1/2 path: 4-FSK matched-filter bank on the complex baseband at the
         # given symbol centers (16 kHz units), with per-frame carrier null (Tier 2).
-        cfo = 0.0 if nocfo else est_cfo(xb, pos16[0] * SAMP / FS,
-                                        pos16[-1] * SAMP / FS)
+        cfo = est_cfo(xb, pos16[0] * SAMP / FS, pos16[-1] * SAMP / FS)
         metric = mf_bank_mag(xb, pos16, baud, cfo=cfo, inv=inv)
         bit_a, bit_b, mag_a, mag_b = mfbank_softbits(metric)
         phases, mags = demux_phases(bit_a, bit_b, mag_a, mag_b, baud)
@@ -159,17 +122,6 @@ def main():
         key = (round(off, 1), par)
         off_hist[key] = off_hist.get(key, 0) + 1
         bch_fail += nf; bch_corr += nc
-        if args.pf:
-            bsyms = sample_at(bpos)
-            c = kmeans4(bsyms)
-            gaps = np.diff(c)
-            # within-level spread proxy: residual after assigning to nearest center
-            d = np.abs(bsyms[:, None] - c[None, :]); lab = d.argmin(1)
-            resid = np.sqrt(np.mean((bsyms - c[lab]) ** 2))
-            merit = float(np.min(gaps) / (resid + 1e-9))
-            print(f"[pf] off={off:+.1f} par={par} fail={nf:3d} "
-                  f"c=[{c[0]:+.1f},{c[1]:+.1f},{c[2]:+.1f},{c[3]:+.1f}] "
-                  f"resid={resid:.2f} merit={merit:.2f}")
         for words, cf in zip(wordsets, confsets):
             if words is not None:
                 pages.extend(parse_frame(words, cf))
@@ -228,11 +180,9 @@ def main():
             mg = pc["margin"] if pc else float("nan")
             samples.append((t, typ, mg, pr, en, body.decode("ascii", "replace")))
 
-    fe = "mfbank" + ("" if nocfo else "+cfo") + ("+inv" if inv else "")
-    acq = "corr-grid"
-    fe = f"{fe}/{acq}"
-    ctxt = f" carrier={center_mhz + carrier/1e6:.4f}MHz (offset{carrier/1e3:+.0f}kHz)" if carrier else ""
-    print(f"=== front-end={fe} soft={soft} comb=True{ctxt} ===")
+    fe = "mfbank+cfo" + ("+inv" if inv else "")
+    ctxt = f" carrier offset {carrier/1e3:+.0f} kHz" if carrier else ""
+    print(f"=== front-end={fe}/corr-grid soft={soft} comb=True{ctxt} ===")
     print(f"frames        : {len(frames)} (anchors synced={n_anchor}, comb-synth={len(frames)-n_anchor})")
     print(f"BCH corrected : {bch_corr}   Chase-recovered: {bch_chase}   BCH FAILED: {bch_fail}")
     nonempty = sum(tiers.values())

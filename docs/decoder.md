@@ -231,9 +231,7 @@ Run `flex_batch.py --help` for the complete list.
 | `--carrier HZ` | De-rotate to a channel at this offset before decoding. |
 | `--lpf HZ` | Channel low-pass cutoff (default 12000). |
 | `--in-rate HZ` | Capture sample rate in Hz (default 250000). |
-| `--center MHZ` | Display-only capture center, for labelling carriers. |
 | `--inv` | Invert the tone→level polarity map. |
-| `--diag`, `--pf` | Histogram / per-frame diagnostics. |
 
 Output: per-frame stats, the A/B/C/D confidence summary, a by-type/tier breakdown,
 and sample message bodies tagged `[tier margin printable% english]`.

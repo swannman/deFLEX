@@ -1,6 +1,6 @@
 # deFLEX — a modern FLEX + POCSAG paging decoder
 
-A from-scratch numpy/scipy decoder for the **FLEX** (TIA-1500) and **POCSAG**
+A from-scratch decoder for the **FLEX** (TIA-1500) and **POCSAG**
 paging protocols, built around a modern DSP front end and optimized for
 **alphanumeric** pages. On alpha traffic it **exceeds `multimon-ng`**: every page
 it emits is BCH/Chase-validated and garbage-free, and it recovers weak carriers
@@ -45,7 +45,7 @@ The **executables** live at the root; the importable **libraries** live in
 multi-carrier, multi-protocol harness.
 
 ```
-start_receiver.py   live harness: one SDR -> channelize -> a decoder per carrier
+start_receiver.py   multi-channel receiver: one SDR -> channelize -> a decoder per carrier
                     (--flex / --pocsag lists; a shared freq gets both)
 flex_receiver.py    single-carrier live FLEX receiver (+ --file replay)
 pocsag_receiver.py  single-carrier live POCSAG receiver (+ --file replay)

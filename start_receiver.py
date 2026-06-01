@@ -53,6 +53,13 @@ def main():
                     help=f"SDR capture sample rate in Hz (default {R.SAMP_RATE})")
     ap.add_argument("--driver", default="sdrplay",
                     help="SoapySDR driver (sdrplay|rtlsdr|airspy)")
+    ap.add_argument("--gain",
+                    help="SDR gain: 'agc', overall dB (e.g. 37), or per-element "
+                         "ELEM=VAL pairs (airspy: LNA,MIX,VGA 0-15; sdrplay: "
+                         "RFGR,IFGR). Default: per-driver manual gain.")
+    ap.add_argument("--antenna", help="SDR antenna port (e.g. 'Antenna A' for sdrplay)")
+    ap.add_argument("--ppm", type=float, help="frequency correction in ppm")
+    ap.add_argument("--bandwidth", type=float, help="analog filter bandwidth in Hz")
     ap.add_argument("--inv", action="store_true",
                     help="invert FLEX tone polarity for a spectrally-mirrored capture "
                          "(POCSAG auto-detects polarity, so this only affects FLEX)")
@@ -68,14 +75,18 @@ def main():
         ap.error("specify at least one carrier via --flex and/or --pocsag")
     center = (int(round(args.center * 1e6)) if args.center is not None
               else (min(carriers) + max(carriers)) // 2)
+    gain = R.parse_gain(args.gain)
 
     if args.dry_run:
         print(R.plan_text(flex, pocsag, center, args.samp_rate, args.driver))
+        print(f"gain={args.gain or 'default'} antenna={args.antenna or 'default'} "
+              f"ppm={args.ppm} bandwidth={args.bandwidth}")
         return
     import receiver_sdr           # GNU Radio; imported only for the live path
     receiver_sdr.run_live(flex, pocsag, center, samp_rate=args.samp_rate,
                           driver=args.driver, log_dir=args.log or R.LOG_DIR,
-                          inv=args.inv)
+                          inv=args.inv, gain=gain, antenna=args.antenna,
+                          ppm=args.ppm, bandwidth=args.bandwidth)
 
 
 if __name__ == "__main__":

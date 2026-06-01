@@ -52,34 +52,67 @@ class RingSink(gr.sync_block):
         return len(input_items[0])
 
 
-def build_source(driver, center, samp_rate):
-    """SoapySDR source tuned to `center`. sdrplay and airspy use fixed manual gain
-    (AGC pumps on the noise floor and corrupts marginal paging bursts); rtlsdr
-    keeps AGC."""
+# Per-driver default gain when --gain is not given. AGC pumps on the noise floor
+# and corrupts marginal paging bursts, so sdrplay/airspy use fixed manual gain;
+# rtlsdr keeps AGC. Each value is 'agc', an overall dB number, or {element: value}.
+_DEFAULT_GAIN = {
+    "sdrplay": {"RFGR": 4, "IFGR": 25},
+    "airspy":  {"LNA": 14, "MIX": 12, "VGA": 11},   # 0-15 each, ~37 dB total
+    "rtlsdr":  "agc",
+}
+_DEFAULT_ANTENNA = {"sdrplay": "Antenna A"}
+
+
+def build_source(driver, center, samp_rate, gain=None, antenna=None,
+                 ppm=None, bandwidth=None):
+    """SoapySDR source for `driver`, tuned to `center`. All knobs default per
+    driver (see _DEFAULT_GAIN/_DEFAULT_ANTENNA) and are overridable:
+      gain      -- 'agc', an overall dB float, or a {element: value} dict
+      antenna   -- antenna port name
+      ppm       -- frequency correction (ppm), optional/driver-dependent
+      bandwidth -- analog filter bandwidth (Hz), optional/driver-dependent
+    """
     src = soapy.source(f"driver={driver}", "fc32", 1, "", "", [""], [""])
     src.set_sample_rate(0, samp_rate)
     src.set_frequency(0, center)
-    if driver == "sdrplay":
-        src.set_gain_mode(0, False)
-        src.set_gain(0, "RFGR", 4)
-        src.set_gain(0, "IFGR", 25)
-        src.set_antenna(0, "Antenna A")
-    elif driver == "airspy":
-        src.set_gain_mode(0, False)
-        src.set_gain(0, "LNA", 14)          # of 15
-        src.set_gain(0, "MIX", 12)          # of 15
-        src.set_gain(0, "VGA", 11)          # of 15  (~37 dB total)
+
+    g = gain if gain is not None else _DEFAULT_GAIN.get(driver, "agc")
+    if g == "agc":
+        src.set_gain_mode(0, True)
     else:
-        src.set_gain_mode(0, True)          # AGC (rtlsdr)
+        src.set_gain_mode(0, False)
+        if isinstance(g, dict):
+            for elem, val in g.items():
+                src.set_gain(0, elem, float(val))
+        else:
+            src.set_gain(0, float(g))       # overall gain; Soapy distributes
+
+    ant = antenna if antenna is not None else _DEFAULT_ANTENNA.get(driver)
+    if ant:
+        src.set_antenna(0, ant)
+    # ppm / bandwidth are not supported by every driver or gr-soapy build; apply
+    # defensively so an unsupported knob warns rather than crashes the receiver.
+    if ppm is not None:
+        try:
+            src.set_frequency_correction(0, float(ppm))
+        except (AttributeError, RuntimeError) as e:
+            print(f"warning: --ppm not applied ({e})", file=sys.stderr)
+    if bandwidth is not None:
+        try:
+            src.set_bandwidth(0, float(bandwidth))
+        except (AttributeError, RuntimeError) as e:
+            print(f"warning: --bandwidth not applied ({e})", file=sys.stderr)
     return src
 
 
-def build_channelizer(carrier_queues, center, samp_rate, driver):
+def build_channelizer(carrier_queues, center, samp_rate, driver, gain=None,
+                      antenna=None, ppm=None, bandwidth=None):
     """source -> per-carrier freq_xlate(decimate to CHAN_RATE) -> RingSink.
     carrier_queues: {carrier_hz: [queue, ...]}. Returns a startable top_block
     with .rings[carrier] for drop-stats."""
     tb = gr.top_block("receiver")
-    src = build_source(driver, center, samp_rate)
+    src = build_source(driver, center, samp_rate, gain=gain, antenna=antenna,
+                       ppm=ppm, bandwidth=bandwidth)
     decim = int(round(samp_rate / RC.CHAN_RATE))
     # Wide 60 kHz transition keeps the tap count low (~137); after decimation the
     # first alias folds in near CHAN_RATE-9000 ~= 241 kHz, leaving huge guard.
@@ -96,10 +129,13 @@ def build_channelizer(carrier_queues, center, samp_rate, driver):
 
 
 def run_live(flex_carriers, pocsag_carriers, center, samp_rate=RC.SAMP_RATE,
-             driver="sdrplay", log_dir=RC.LOG_DIR, inv=False):
+             driver="sdrplay", log_dir=RC.LOG_DIR, inv=False,
+             gain=None, antenna=None, ppm=None, bandwidth=None):
     """Tune one SDR to `center`, channelize, and spawn one worker process per
     (carrier, protocol). Blocks until KeyboardInterrupt. `inv` flips FLEX tone
-    polarity for a spectrally-mirrored capture (POCSAG auto-detects polarity)."""
+    polarity for a spectrally-mirrored capture (POCSAG auto-detects polarity).
+    gain/antenna/ppm/bandwidth override the per-driver SDR defaults (see
+    build_source)."""
     a = RC.assign(flex_carriers, pocsag_carriers)
     oob = RC.check_in_band(list(a), center, samp_rate)
     if oob:
@@ -128,7 +164,8 @@ def run_live(flex_carriers, pocsag_carriers, center, samp_rate=RC.SAMP_RATE,
             qs.append(q)
         carrier_queues[carrier] = qs
 
-    tb = build_channelizer(carrier_queues, center, samp_rate, driver)
+    tb = build_channelizer(carrier_queues, center, samp_rate, driver, gain=gain,
+                           antenna=antenna, ppm=ppm, bandwidth=bandwidth)
     nflex = sum(1 for v in a.values() if "flex" in v)
     npoc = sum(1 for v in a.values() if "pocsag" in v)
     print(f"receiver LIVE: {driver} @ {center/1e6:.4f} MHz, {samp_rate} S/s -> "

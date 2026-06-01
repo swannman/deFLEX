@@ -54,6 +54,12 @@ def main():
                     help="FLEX carrier frequency in MHz (required for --live)")
     ap.add_argument("--driver", default="sdrplay",
                     help="SoapySDR driver for --live (sdrplay|rtlsdr|airspy)")
+    ap.add_argument("--gain",
+                    help="SDR gain for --live: 'agc', overall dB, or ELEM=VAL pairs "
+                         "(sdrplay: RFGR,IFGR; airspy: LNA,MIX,VGA). Default: per-driver.")
+    ap.add_argument("--antenna", help="SDR antenna port for --live")
+    ap.add_argument("--ppm", type=float, help="frequency correction in ppm")
+    ap.add_argument("--bandwidth", type=float, help="analog filter bandwidth in Hz")
     ap.add_argument("--inv", action="store_true",
                     help="invert tone->level polarity (spectrally-mirrored capture)")
     ap.add_argument("--log", help=f"log directory for --live (default {RC.LOG_DIR})")
@@ -66,7 +72,9 @@ def main():
         freq = int(round(args.freq * 1e6))
         import receiver_sdr       # GNU Radio; imported only for the live path
         receiver_sdr.run_live([freq], [], freq, driver=args.driver,
-                              log_dir=args.log or RC.LOG_DIR, inv=args.inv)
+                              log_dir=args.log or RC.LOG_DIR, inv=args.inv,
+                              gain=RC.parse_gain(args.gain), antenna=args.antenna,
+                              ppm=args.ppm, bandwidth=args.bandwidth)
     else:
         ap.error("specify --file CFILE or --live")
 

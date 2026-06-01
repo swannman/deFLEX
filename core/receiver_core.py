@@ -133,6 +133,29 @@ def check_in_band(carriers, center, samp_rate):
     return [c for c in carriers if abs(c - center) > half]
 
 
+def parse_gain(spec):
+    """Parse a --gain string into the form build_source expects (kept here so the
+    GR-free dry-run path can parse without importing GNU Radio):
+      None         -> None   (use the per-driver default in build_source)
+      'agc'        -> 'agc'   (hardware AGC)
+      '37'         -> 37.0    (overall gain in dB; Soapy distributes across stages)
+      'LNA=14,MIX=12,VGA=11' -> {'LNA':14.0,'MIX':12.0,'VGA':11.0}  (per element)
+    """
+    if spec is None:
+        return None
+    spec = spec.strip()
+    if spec.lower() == "agc":
+        return "agc"
+    if "=" in spec:
+        out = {}
+        for tok in spec.split(","):
+            if tok.strip():
+                k, v = tok.split("=", 1)
+                out[k.strip()] = float(v)
+        return out
+    return float(spec)
+
+
 def plan_text(flex_carriers, pocsag_carriers, center, samp_rate, driver):
     """Human-readable channelization plan for --dry-run (no SDR access)."""
     a = assign(flex_carriers, pocsag_carriers)

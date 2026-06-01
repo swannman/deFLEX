@@ -11,7 +11,7 @@ The StreamDecoder (in flex_core) re-runs the validated batch decode on overlappi
 windows and de-duplicates by frame slot, so the live output matches batch exactly.
 
 Modes:
-  --live --carriers MHz,MHz,... [--center MHz] [FIFO_DIR]
+  --live --carriers MHz,MHz,... [--center MHz] [--log DIR]
                                 live SDR, one process per carrier. Carrier
                                 frequencies are given in MHz; the tuner center
                                 defaults to their midpoint.
@@ -211,8 +211,8 @@ def run_file(cfile, in_rate):
 QUEUE_MAXCHUNKS = 1024
 
 
-def run_live(fifo_dir, carriers, center, driver="sdrplay"):
-    os.makedirs(LOG_DIR, exist_ok=True)
+def run_live(carriers, center, driver="sdrplay", log_dir=LOG_DIR):
+    os.makedirs(log_dir, exist_ok=True)
     queues = {c: mp.Queue(maxsize=QUEUE_MAXCHUNKS) for c in carriers}
     pages = {c: mp.Value('i', 0) for c in carriers}
 
@@ -220,7 +220,7 @@ def run_live(fifo_dir, carriers, center, driver="sdrplay"):
     for carrier in carriers:
         p = mp.Process(target=worker_proc,
                        args=(carrier, queues[carrier], IN_RATE, WINDOW_FR,
-                             ADVANCE_FR, f"{LOG_DIR}/{carrier}.flexdec.log",
+                             ADVANCE_FR, f"{log_dir}/{carrier}.flexdec.log",
                              pages[carrier]),
                        daemon=True)
         p.start()
@@ -271,7 +271,7 @@ def main():
                          "midpoint of --carriers")
     ap.add_argument("--driver", default="sdrplay",
                     help="SoapySDR driver for --live (sdrplay|rtlsdr|airspy)")
-    ap.add_argument("fifo_dir", nargs="?", default="/tmp/flex")
+    ap.add_argument("--log", help=f"log directory for --live (default {LOG_DIR})")
     args = ap.parse_args()
     if args.file:
         run_file(args.file, args.in_rate)
@@ -289,7 +289,7 @@ def main():
             ap.error(f"carriers outside the {SAMP_RATE/1e6:.1f} MHz capture window "
                      f"around {center/1e6:.4f} MHz: "
                      f"{[c/1e6 for c in out_of_band]} MHz")
-        run_live(args.fifo_dir, carriers, center, driver=args.driver)
+        run_live(carriers, center, driver=args.driver, log_dir=args.log or LOG_DIR)
     else:
         ap.error("specify --file CFILE or --live")
 

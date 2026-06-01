@@ -232,8 +232,10 @@ Run `flex_batch.py --help` for the complete list.
 | `--in-rate HZ` | Capture sample rate in Hz (default 250000). |
 | `--inv` | Invert the tone→level polarity map (spectrally-mirrored capture). |
 
-Output: per-frame stats, the A/B/C/D confidence summary, a by-type/tier breakdown,
-and sample message bodies tagged `[tier margin printable% english]`.
+Output: each trustworthy (A/B) page on **stdout**, one per line
+(`cap=<capcode> <type> <tier> en=<score>  <body>`), so `flex_batch … | grep` sees
+just the pages — like `pocsag_batch`. The FEC/tier report (frames, BCH/Chase
+counts, A/B/C/D confidence, by-type breakdown) goes to **stderr**.
 
 ### POCSAG
 

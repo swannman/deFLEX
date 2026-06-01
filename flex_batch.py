@@ -70,7 +70,7 @@ def main():
     frames = corr_frames(demod, p0_offset=corr_off, grid=True,
                          include_thr=corr_thr)
     n_anchor = len(frames)
-    frames = add_comb_frames(frames, len(demod), verbose=True)
+    frames = add_comb_frames(frames, len(demod), verbose=False)
 
     def decode_mf(pos16, baud, levels, chase=False):
         # Tier 1/2 path: 4-FSK matched-filter bank on the complex baseband at the
@@ -123,7 +123,8 @@ def main():
             if words is not None:
                 pages.extend(parse_frame(words, cf))
     if sweep:
-        print(f"[sweep] chosen (offset,parity) histogram: {dict(sorted(off_hist.items()))}")
+        print(f"[sweep] chosen (offset,parity) histogram: {dict(sorted(off_hist.items()))}",
+              file=sys.stderr)
 
     # confidence-graded classification (NO hard BCH gate): emit every page, score it.
     # Tier A verified : all words clean syndrome (status 0) AND min-margin healthy.
@@ -136,7 +137,7 @@ def main():
     empty = 0
     tiers = {"A": 0, "B": 0, "C": 0, "D": 0}
     by_tier_type = {"A": {}, "B": {}, "C": {}, "D": {}}
-    samples = []
+    trustworthy = []                       # A/B pages, printed one per line to stdout
 
     def tier_of(pc, pr, en):
         # RF/FEC confidence first, then a body-text sanity check: a page the RF
@@ -173,26 +174,25 @@ def main():
         t = tier_of(pc, pr, en)
         tiers[t] += 1
         by_tier_type[t][typ] = by_tier_type[t].get(typ, 0) + 1
-        if t in ("A", "B") or len(samples) < 36:
-            mg = pc["margin"] if pc else float("nan")
-            samples.append((t, typ, mg, pr, en, body.decode("ascii", "replace")))
+        if t in ("A", "B"):
+            trustworthy.append((cap, typ, t, en, body.decode("ascii", "replace")))
 
+    # Stats to stderr (FLEX-specific FEC/tier report); decoded pages to stdout, one
+    # per line, so `flex_batch ... | grep` sees just the pages (like pocsag_batch).
     fe = "mfbank+cfo" + ("+inv" if inv else "")
     ctxt = f" carrier offset {carrier/1e3:+.0f} kHz" if carrier else ""
-    print(f"=== front-end={fe}/corr-grid soft={soft} comb=True{ctxt} ===")
-    print(f"frames        : {len(frames)} (anchors synced={n_anchor}, comb-synth={len(frames)-n_anchor})")
-    print(f"BCH corrected : {bch_corr}   Chase-recovered: {bch_chase}   BCH FAILED: {bch_fail}")
     nonempty = sum(tiers.values())
-    print(f"pages emitted : {len(pages)}  (empty={empty}, nonempty={nonempty})")
-    print(f"confidence    : A_verified={tiers['A']}  B_fec={tiers['B']}  "
-          f"C_suspect={tiers['C']}  D_failed={tiers['D']}   (trustworthy A+B={tiers['A']+tiers['B']})")
-    print(f"by type/tier  : A={by_tier_type['A']} B={by_tier_type['B']} "
-          f"C={by_tier_type['C']} D={by_tier_type['D']}")
-    print("--- samples [tier margin printable% english] ---")
-    for t, typ, mg, pr, en, s in sorted(samples, key=lambda x: x[0]):
-        mtxt = f"{mg:4.2f}" if mg == mg else " nan"
+    print(f"=== front-end={fe}/corr-grid soft={soft} comb=True{ctxt} ===\n"
+          f"frames        : {len(frames)} (anchors synced={n_anchor}, comb-synth={len(frames)-n_anchor})\n"
+          f"BCH corrected : {bch_corr}   Chase-recovered: {bch_chase}   BCH FAILED: {bch_fail}\n"
+          f"pages emitted : {len(pages)}  (empty={empty}, nonempty={nonempty})\n"
+          f"confidence    : A_verified={tiers['A']}  B_fec={tiers['B']}  "
+          f"C_suspect={tiers['C']}  D_failed={tiers['D']}   (trustworthy A+B={tiers['A']+tiers['B']})\n"
+          f"by type/tier  : A={by_tier_type['A']} B={by_tier_type['B']} "
+          f"C={by_tier_type['C']} D={by_tier_type['D']}", file=sys.stderr)
+    for cap, typ, t, en, s in trustworthy:
         entxt = f" en={en:.2f}" if alpha_only else ""
-        print(f"  [{t} m={mtxt} pr={pr:.2f}{entxt}] {typ}: {s!r}")
+        print(f"cap={cap:>9} {typ} {t}{entxt}  {s!r}")
 
 if __name__ == "__main__":
     main()

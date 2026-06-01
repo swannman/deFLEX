@@ -42,19 +42,19 @@ STITCH_TIMEOUT = 8.0     # seconds to wait for continuation fragments
 # entirely — automated test/heartbeat pages with no human value.
 DROP_SUBSTRINGS = ("test page",)
 
-# Carriers excluded from the feed. 929662500 is an always-on TEST transmitter
-# (broadcasts FEC/filler patterns, never real pages) — useful as a known-good
-# decode signal but no human-readable content, so keep it out of the viewer.
-SKIP_CARRIERS = {"929662500"}
+# Carriers excluded from the feed (none by default). 929662500 was assumed to be
+# a test transmitter, but the band census found it carries live traffic.
+SKIP_CARRIERS = set()
 
 # Map carrier center freq (Hz, = log filename) to the paging network name.
 CARRIER_NAME = {
     "929587500": "Spok",
     "929612500": "Spok",
-    "929662500": "Spok-test",
+    "929662500": "Spok",
     "929937500": "AmerMsg",
     "931062500": "AmerMsg",
     "931212500": "Spok",
+    "931862500": "Spok",
     "931937500": "SkyTel",
     "152007500": "SNO911",     # VHF POCSAG fire/EMS dispatch (pocsag_receiver)
 }

@@ -218,18 +218,20 @@ By default only alpha (ALN/SPN) pages are kept and graded against the
 python3 flex_batch.py capture.cfile
 
 # Decode a neighbouring channel by frequency offset within the same capture:
-python3 flex_batch.py capture.cfile --carrier=50000
+python3 flex_batch.py capture.cfile --carrier 50000
 ```
 
 ### FLEX flags
 
+Run `flex_batch.py --help` for the complete list.
+
 | Flag | Effect |
 |---|---|
 | `--all` | Emit every page type (NUM/NNM too) and skip the `english_score` gate. |
-| `--carrier=HZ` | De-rotate to a channel at this offset before decoding. |
-| `--lpf=HZ` | Channel low-pass cutoff (default 12000). |
-| `--samp-rate=HZ` | Capture sample rate (default 250000). |
-| `--center=MHZ` | Display-only capture center, for labelling carriers. |
+| `--carrier HZ` | De-rotate to a channel at this offset before decoding. |
+| `--lpf HZ` | Channel low-pass cutoff (default 12000). |
+| `--in-rate HZ` | Capture sample rate in Hz (default 250000). |
+| `--center MHZ` | Display-only capture center, for labelling carriers. |
 | `--inv` | Invert the tone→level polarity map. |
 | `--diag`, `--pf` | Histogram / per-frame diagnostics. |
 

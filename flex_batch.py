@@ -12,8 +12,8 @@ acquisition, comb-synthesized frames, timing/parity sweep, and Chase-II soft FEC
 By default only alpha pages (ALN/SPN) are kept and graded; pass --all to emit every
 page type without the English-readability gate.
 
-Usage: flex_batch.py <cfile> [--all] [--carrier=HZ] [--lpf=HZ]
-                    [--samp-rate=HZ] [--center=MHZ] [--inv] [--diag]
+Run `flex_batch.py --help` for the full flag list. Typical use:
+    flex_batch.py capture.cfile [--in-rate HZ] [--carrier HZ] [--all]
 """
 import os
 import sys
@@ -31,39 +31,57 @@ from flex_core import *          # noqa: F401,F403 -- decode functions + constan
 # never hard-drops a page -- it labels confidence and lets the caller choose. The
 # live receivers import the same building blocks from flex_core directly.
 def main():
-    if len(sys.argv) < 2 or sys.argv[1].startswith("-"):
-        sys.exit("usage: flex_batch.py <cfile> [--all] [options]")
-    cfile = sys.argv[1]
-    diag = "--diag" in sys.argv
+    import argparse
+    ap = argparse.ArgumentParser(
+        description="FLEX batch decoder: decode a recorded .cfile capture and grade "
+                    "every page by confidence tier (A=verified, B=FEC-corrected, "
+                    "C=suspect, D=failed). The full-strength decode chain is always on; "
+                    "by default only alpha (ALN/SPN) pages are kept and graded against "
+                    "the english_score readability gate.")
+    ap.add_argument("cfile", help="raw complex64 IQ capture")
+    ap.add_argument("--in-rate", type=float, default=None,
+                    help="capture sample rate in Hz (default: 250000 = decoder SAMP)")
+    ap.add_argument("--all", action="store_true",
+                    help="emit every page type (NUM/NNM too) and skip the english_score gate")
+    ap.add_argument("--carrier", type=float, default=0.0,
+                    help="channel-select offset in Hz within the +-fs/2 capture band")
+    ap.add_argument("--lpf", type=float, default=12000.0,
+                    help="channel low-pass cutoff in Hz (default 12000)")
+    ap.add_argument("--center", type=float, default=929.6125,
+                    help="display-only capture center in MHz, for labelling carriers")
+    ap.add_argument("--mflen", type=int, default=SPB,
+                    help="matched-filter length in samples (default SPB)")
+    ap.add_argument("--inv", action="store_true",
+                    help="invert the tone->level polarity map")
+    ap.add_argument("--nocfo", action="store_true",
+                    help="disable the per-frame carrier-offset null (Tier 2)")
+    ap.add_argument("--mf", action="store_true",
+                    help="apply the front-end matched filter in the demod stage")
+    ap.add_argument("--diag", action="store_true",
+                    help="print symbol-histogram / adaptive-threshold diagnostics")
+    ap.add_argument("--pf", action="store_true",
+                    help="print per-frame slicer-merit diagnostics")
+    args = ap.parse_args()
 
-    mflen = SPB
-    lpf = 12000.0
-    carrier = 0.0          # channel-select offset (Hz) within the +-fs/2 capture band
-    in_rate = None         # input file sample rate (None -> assume SAMP=250k)
-    center_mhz = 929.6125  # display-only: capture center freq for labelling carriers
-    for a in sys.argv:
-        if a.startswith("--mflen="):
-            mflen = int(a.split("=", 1)[1])
-        if a.startswith("--lpf="):
-            lpf = float(a.split("=", 1)[1])
-        if a.startswith("--carrier="):
-            carrier = float(a.split("=", 1)[1])
-        if a.startswith("--samp-rate="):
-            in_rate = float(a.split("=", 1)[1])
-        if a.startswith("--center="):
-            center_mhz = float(a.split("=", 1)[1])
-    nocfo = "--nocfo" in sys.argv               # disable Tier 2 per-frame carrier null
-    inv = "--inv" in sys.argv                   # reverse tone->level map (polarity)
+    cfile = args.cfile
+    in_rate = args.in_rate         # None -> front_end assumes SAMP=250k
+    mflen = args.mflen
+    lpf = args.lpf
+    carrier = args.carrier         # channel-select offset (Hz) within the +-fs/2 band
+    center_mhz = args.center       # display-only, for labelling carriers
+    nocfo = args.nocfo             # disable Tier 2 per-frame carrier null
+    inv = args.inv                 # reverse tone->level map (polarity)
+    diag = args.diag
     # --carrier shifts a neighbouring FLEX channel down to baseband (load_baseband
     # de-rotates by `carrier` Hz; the existing LPF then isolates it, pushing the
     # original centre carrier out of band). Lets us decode every channel that falls
     # within the +-125 kHz of the SAME capture IQ -- a true multi-carrier decode
     # with no new capture. The sync state machine auto-detects the channel's mode.
-    demod, xb = front_end(cfile, cfo=carrier, mf=("--mf" in sys.argv), mflen=mflen,
+    demod, xb = front_end(cfile, cfo=carrier, mf=args.mf, mflen=mflen,
                           lpf=lpf, return_baseband=True, in_rate=in_rate)
     demod = demod - np.median(demod)            # global DC/CFO removal
     corr_off = 1517.0                           # peak->frame-start offset for corr_frames
-    alpha_only = "--all" not in sys.argv        # optimize for ALN/SPN: drop NUM/NNM (--all keeps every type)
+    alpha_only = not args.all                   # optimize for ALN/SPN: drop NUM/NNM (--all keeps every type)
     # alpha-only lets us comb aggressively: garbage numeric pages (which always
     # look 'printable') would otherwise flood the tiers, but we discard them, and
     # garbage alpha is self-evidently non-English (caught by the printable gate).
@@ -141,7 +159,7 @@ def main():
         key = (round(off, 1), par)
         off_hist[key] = off_hist.get(key, 0) + 1
         bch_fail += nf; bch_corr += nc
-        if "--pf" in sys.argv:
+        if args.pf:
             bsyms = sample_at(bpos)
             c = kmeans4(bsyms)
             gaps = np.diff(c)

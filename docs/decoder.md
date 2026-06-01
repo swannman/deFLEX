@@ -230,9 +230,6 @@ python3 flex_batch.py capture.cfile --carrier=50000
 | `--lpf=HZ` | Channel low-pass cutoff (default 12000). |
 | `--samp-rate=HZ` | Capture sample rate (default 250000). |
 | `--center=MHZ` | Display-only capture center, for labelling carriers. |
-| `--corr-peaks` | Acquire only at detected peaks (no grid comb). |
-| `--corr-off=N` | Peak→frame-start offset (default 1517). |
-| `--frac` | Fractional (sub-sample) timing sweep. |
 | `--inv` | Invert the tone→level polarity map. |
 | `--diag`, `--pf` | Histogram / per-frame diagnostics. |
 

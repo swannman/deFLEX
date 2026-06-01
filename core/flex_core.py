@@ -389,7 +389,7 @@ def corr_frames(demod, p0_offset=1517.0, grid=True, score_hi=0.6, include_thr=0.
     (matching what a continuous tracker locks) and on a busy carrier we take all
     of them. Returns frame anchor dicts compatible with the decode path
     (syms=None; the MF-bank/FM paths recompute symbol centers from p0/spb/nsyms).
-    grid=False (--corr-peaks) instead decodes only the detected high-score peaks."""
+    grid=False instead decodes only the detected high-score peaks."""
     peaks = corr_acquire(demod)
     hi = [(p, m, h) for p, m, h in peaks if h > score_hi]
     if not hi:
@@ -922,7 +922,7 @@ def dedup_body(body):
 # Mirror of the validated full-strength run: matched-filter bank + correlator
 # acquisition + comb + sweep + Chase soft FEC, alpha-optimized.
 DEFAULT_CFG = dict(
-    nocfo=False, inv=False, soft=True, sweep=True, sweep_half=1, frac=False,
+    nocfo=False, inv=False, soft=True, sweep=True, sweep_half=1,
     alpha_only=True, comb=True, mflen=SPB, corr_off=1517.0,
     lpf=12000.0, in_rate=SAMP, MARGIN_OK=0.5, ALPHA_EN_OK=0.60,
 )
@@ -1000,8 +1000,6 @@ def decode_window(xb, s0, cfg):
         spb = f["spb"]; p0 = f["p0"]; nsyms = f["nsyms"]
         if not cfg["sweep"]:
             offs = [0.0]
-        elif cfg["frac"]:
-            offs = list(np.arange(-spb / 2, spb / 2, 0.5))
         else:
             # Timing-phase search around the sync-locked grid. mf_bank_mag is the
             # bulk of decode CPU and the sweep multiplies it by len(offs)*len(pars)

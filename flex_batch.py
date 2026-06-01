@@ -62,19 +62,13 @@ def main():
     demod, xb = front_end(cfile, cfo=carrier, mf=("--mf" in sys.argv), mflen=mflen,
                           lpf=lpf, return_baseband=True, in_rate=in_rate)
     demod = demod - np.median(demod)            # global DC/CFO removal
-    corr_grid = "--corr-peaks" not in sys.argv   # comb all grid slots (vs only detected peaks)
-    corr_off = 1517.0
+    corr_off = 1517.0                           # peak->frame-start offset for corr_frames
     alpha_only = "--all" not in sys.argv        # optimize for ALN/SPN: drop NUM/NNM (--all keeps every type)
     # alpha-only lets us comb aggressively: garbage numeric pages (which always
     # look 'printable') would otherwise flood the tiers, but we discard them, and
     # garbage alpha is self-evidently non-English (caught by the printable gate).
     corr_thr = -1.0 if alpha_only else 0.35
-    for a in sys.argv:
-        if a.startswith("--corr-off="):
-            corr_off = float(a.split("=", 1)[1])
-        if a.startswith("--corr-thr="):
-            corr_thr = float(a.split("=", 1)[1])
-    frames = corr_frames(demod, p0_offset=corr_off, grid=corr_grid,
+    frames = corr_frames(demod, p0_offset=corr_off, grid=True,
                          include_thr=corr_thr)
     n_anchor = len(frames)
     frames = add_comb_frames(frames, len(demod), verbose=True)
@@ -110,7 +104,6 @@ def main():
         return decode_phases(phases, mags, chase=chase)
 
     sweep = True
-    frac = "--frac" in sys.argv          # sub-sample (fractional) phase search
     soft = True                          # Chase-II soft-decision FEC on hard fails
     pages = []
     bch_fail = bch_corr = bch_chase = 0
@@ -119,8 +112,6 @@ def main():
         spb = f["spb"]; p0 = f["p0"]; nsyms = f["nsyms"]
         if not sweep:
             offs = [0.0]
-        elif frac:
-            offs = list(np.arange(-spb / 2, spb / 2, 0.5))
         else:
             offs = [float(o) for o in range(-(spb // 2), spb - spb // 2)]
         # symbol-parity search: 3200-baud A/C de-mux can land on the wrong
@@ -220,7 +211,7 @@ def main():
             samples.append((t, typ, mg, pr, en, body.decode("ascii", "replace")))
 
     fe = "mfbank" + ("" if nocfo else "+cfo") + ("+inv" if inv else "")
-    acq = "corr-grid" if corr_grid else "corr-peaks"
+    acq = "corr-grid"
     fe = f"{fe}/{acq}"
     ctxt = f" carrier={center_mhz + carrier/1e6:.4f}MHz (offset{carrier/1e3:+.0f}kHz)" if carrier else ""
     print(f"=== front-end={fe} soft={soft} comb=True{ctxt} ===")

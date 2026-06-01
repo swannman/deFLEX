@@ -53,8 +53,9 @@ class RingSink(gr.sync_block):
 
 
 def build_source(driver, center, samp_rate):
-    """SoapySDR source tuned to `center`. sdrplay uses the validated manual gain
-    (matches the 900 MHz FLEX setup); other drivers use AGC."""
+    """SoapySDR source tuned to `center`. sdrplay and airspy use fixed manual gain
+    (AGC pumps on the noise floor and corrupts marginal paging bursts); rtlsdr
+    keeps AGC."""
     src = soapy.source(f"driver={driver}", "fc32", 1, "", "", [""], [""])
     src.set_sample_rate(0, samp_rate)
     src.set_frequency(0, center)
@@ -63,8 +64,13 @@ def build_source(driver, center, samp_rate):
         src.set_gain(0, "RFGR", 4)
         src.set_gain(0, "IFGR", 25)
         src.set_antenna(0, "Antenna A")
+    elif driver == "airspy":
+        src.set_gain_mode(0, False)
+        src.set_gain(0, "LNA", 14)          # of 15
+        src.set_gain(0, "MIX", 12)          # of 15
+        src.set_gain(0, "VGA", 11)          # of 15  (~37 dB total)
     else:
-        src.set_gain_mode(0, True)          # AGC (rtlsdr/airspy)
+        src.set_gain_mode(0, True)          # AGC (rtlsdr)
     return src
 
 

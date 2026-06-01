@@ -56,7 +56,8 @@ CARRIER_NAME = {
     "931212500": "Spok",
     "931862500": "Spok",
     "931937500": "SkyTel",
-    "152007500": "SNO911",     # VHF POCSAG fire/EMS dispatch (pocsag_receiver)
+    "152007500": "SNO911",     # VHF POCSAG fire/EMS dispatch (SNOCO simulcast)
+    "453900000": "Alarm-70cm", # UHF POCSAG fire-alarm paging
 }
 
 # ---- State ----

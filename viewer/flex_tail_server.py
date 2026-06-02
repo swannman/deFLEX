@@ -6,9 +6,10 @@ displayed text is ONLY the human message body — no capcode/phone, frame, baud,
 or fragment metadata is ever sent to the client.
 
 Post-processing (server-side, using metadata that is NOT exposed to the page):
-  * De-duplication: identical (capcode, body) seen again within DEDUP_WINDOW is
-    suppressed. Kills network retransmits and the same page heard on two
-    carriers. The capcode is used only as a key and is never sent to clients.
+  * De-duplication: identical (carrier, body) seen again within DEDUP_WINDOW is
+    suppressed. Kills network retransmits AND the dispatch broadcast that sends
+    the same text to many unit RICs at once. The capcode is used only as a
+    fragment-stitch key and is never sent to clients.
   * Fragment stitching: multimon-ng tags each ALN line with K/F/C
     (K = complete; F = fragment, needs continuation; C = continuation of a
     fragment). An F line opens a per-capcode buffer; subsequent C lines for that
@@ -171,7 +172,7 @@ class Processor:
     def __init__(self, emit_cb):
         self.emit_cb = emit_cb
         self.pending: dict[str, dict] = {}   # capcode -> {parts, ts, carrier, deadline}
-        self.seen: dict[tuple, float] = {}   # (capcode, body) -> expiry
+        self.seen: dict[tuple, float] = {}   # (carrier, body) -> expiry
 
     def _emit(self, capcode, ts, carrier, body, now, stitched):
         body = body.strip()
@@ -181,7 +182,11 @@ class Processor:
         if any(s in low for s in DROP_SUBSTRINGS):
             stats["dropped"] += 1
             return
-        key = (capcode, body)
+        # Dedup on (carrier, body), NOT capcode: dispatch systems blast the same
+        # message to many unit RICs at once, so keying on capcode lets every copy
+        # through. Body-per-carrier collapses the broadcast to one line (and the
+        # capcode is never displayed anyway).
+        key = (carrier, body)
         exp = self.seen.get(key)
         self.seen[key] = now + DEDUP_WINDOW
         if exp and exp > now:

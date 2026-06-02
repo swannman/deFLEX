@@ -19,6 +19,7 @@ Post-processing (server-side, using metadata that is NOT exposed to the page):
 URL:  http://<host>:8091/
 """
 import asyncio
+import difflib
 import glob
 import json
 import os
@@ -36,8 +37,11 @@ STATIC_DIR = Path("/usr/local/share/flex-tail")
 RING_LEN = 300           # messages kept in memory for initial page load
 POLL_INTERVAL = 0.5      # seconds between file polls
 SEED_TAIL_BYTES = 16000  # how much of each log's tail to replay on startup
-DEDUP_WINDOW = 180.0     # seconds an identical (capcode, body) is suppressed
+DEDUP_WINDOW = 180.0     # seconds an identical (carrier, body) is suppressed
 STITCH_TIMEOUT = 8.0     # seconds to wait for continuation fragments
+COALESCE_SECS = 4.0      # hold a new page this long to gather garbled retransmits
+FUZZY_RATIO = 0.85       # SequenceMatcher ratio at/above which two bodies are the
+                         # same transmission (a retransmit FEC-garbled differently)
 
 # Messages whose body contains any of these (case-insensitive) are dropped
 # entirely — automated test/heartbeat pages with no human value.
@@ -150,6 +154,17 @@ def looks_encoded(body: str) -> bool:
     return False
 
 
+def _quality(body: str) -> tuple:
+    """Sort key for picking the least-garbled of several near-identical retransmits
+    (smaller is better). FEC garble corrupts letters into digits/symbols
+    ('Response'->'Reb6nnse', 'Problem'->'PrK`lem'); the structural non-alpha
+    (codes, addresses, punctuation) is identical across true variants, so the
+    garbled copy carries MORE non-alpha characters. Tiebreak: prefer the longer
+    (more complete) body."""
+    non_alpha = sum(1 for c in body if not c.isalpha())
+    return (non_alpha, -len(body))
+
+
 def is_readable(body: str) -> bool:
     """Heuristic: genuine human text vs. encrypted/base64 page or FEC junk."""
     b = body.replace("\\t", " ").replace("\\n", " ").replace("\\r", " ")
@@ -172,7 +187,21 @@ class Processor:
     def __init__(self, emit_cb):
         self.emit_cb = emit_cb
         self.pending: dict[str, dict] = {}   # capcode -> {parts, ts, carrier, deadline}
-        self.seen: dict[tuple, float] = {}   # (carrier, body) -> expiry
+        self.seen: dict[tuple, float] = {}   # (carrier, body) -> expiry  (exact fast path)
+        self.groups: list[dict] = []         # fuzzy coalesce groups (near-dup retransmits)
+
+    def _match_group(self, carrier, body, now):
+        """A still-live coalesce group on this carrier whose body is the same
+        transmission as `body` (fuzzy), or None."""
+        for g in self.groups:
+            if g["carrier"] != carrier or g["expiry"] <= now:
+                continue
+            a = g["body"]
+            if min(len(a), len(body)) / max(len(a), len(body), 1) < 0.7:
+                continue                                  # length prefilter
+            if difflib.SequenceMatcher(None, a, body).ratio() >= FUZZY_RATIO:
+                return g
+        return None
 
     def _emit(self, capcode, ts, carrier, body, now, stitched):
         body = body.strip()
@@ -182,25 +211,39 @@ class Processor:
         if any(s in low for s in DROP_SUBSTRINGS):
             stats["dropped"] += 1
             return
-        # Dedup on (carrier, body), NOT capcode: dispatch systems blast the same
-        # message to many unit RICs at once, so keying on capcode lets every copy
-        # through. Body-per-carrier collapses the broadcast to one line (and the
-        # capcode is never displayed anyway).
+        # Exact dedup on (carrier, body) -- fast path. Keyed on carrier not capcode
+        # because dispatch blasts the same text to many unit RICs at once.
         key = (carrier, body)
-        exp = self.seen.get(key)
-        self.seen[key] = now + DEDUP_WINDOW
-        if exp and exp > now:
+        if self.seen.get(key, 0) > now:
+            self.seen[key] = now + DEDUP_WINDOW
             stats["deduped"] += 1
             return
+        self.seen[key] = now + DEDUP_WINDOW
+        # Fuzzy coalesce: the same page is retransmitted and FEC garbles a few
+        # characters differently each time. Group near-identical bodies and emit
+        # only the least-garbled (fewest non-alpha) variant, once.
+        g = self._match_group(carrier, body, now)
+        cand = _quality(body)
+        if g is not None:
+            stats["deduped"] += 1
+            g["expiry"] = now + DEDUP_WINDOW
+            if not g["emitted"] and cand < g["score"]:   # cleaner -> hold this one
+                g.update(body=body, ts=ts, stitched=stitched, score=cand)
+            return
+        self.groups.append(dict(carrier=carrier, body=body, ts=ts, stitched=stitched,
+                                score=cand, deadline=now + COALESCE_SECS,
+                                expiry=now + DEDUP_WINDOW, emitted=False))
+
+    def _emit_group(self, g):
         stats["emitted"] += 1
-        if stitched:
+        if g["stitched"]:
             stats["stitched"] += 1
         msg = {
-            "ts": ts,
-            "net": CARRIER_NAME.get(carrier, carrier),
-            "body": body,
-            "readable": is_readable(body),
-            "stitched": stitched,
+            "ts": g["ts"],
+            "net": CARRIER_NAME.get(g["carrier"], g["carrier"]),
+            "body": g["body"],
+            "readable": is_readable(g["body"]),
+            "stitched": g["stitched"],
         }
         ring.append(msg)
         self.emit_cb(msg)
@@ -232,6 +275,13 @@ class Processor:
     def tick(self, now):
         for cap in [c for c, p in self.pending.items() if p["deadline"] <= now]:
             self._flush(cap, now)
+        # Emit coalesce groups whose hold window elapsed (best variant chosen),
+        # then drop groups past their dedup window.
+        for g in self.groups:
+            if not g["emitted"] and g["deadline"] <= now:
+                self._emit_group(g)
+                g["emitted"] = True
+        self.groups = [g for g in self.groups if g["expiry"] > now]
         if len(self.seen) > 4000:
             self.seen = {k: e for k, e in self.seen.items() if e > now}
 

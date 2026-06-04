@@ -1,0 +1,152 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  html,body{margin:0;height:100%;font:13px system-ui,sans-serif}
+  #wrap{display:flex;height:100%}
+  #feed{width:33.333%;height:100%;display:flex;flex-direction:column;background:#0c0c0c;color:#ddd;border-right:1px solid #333}
+  #filters{padding:8px 9px;border-bottom:1px solid #333;background:#151515}
+  #filters .row{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+  #filters label{display:inline-flex;align-items:center;gap:3px;cursor:pointer;user-select:none;font-size:12px}
+  #filters .tr{margin-top:8px;display:flex;align-items:center;gap:8px}
+  #hrs{flex:1}
+  #list{flex:1;overflow-y:auto}
+  #map{width:66.667%;height:100%}
+  .item{padding:6px 9px;border-bottom:1px solid #1b1b1b;border-left:4px solid #888;cursor:pointer}
+  .item:hover{background:#181818}
+  .item .meta{font-size:11px;color:#8a8a8a;margin-bottom:2px;display:flex;align-items:center;gap:5px}
+  .item .body{font-size:12.5px;line-height:1.35;word-break:break-word}
+  #hud{position:absolute;top:8px;right:8px;z-index:1000;background:#111d;color:#eee;padding:8px 10px;border-radius:6px}
+  #bar{margin-top:5px;height:9px;width:150px;border-radius:5px;
+       background:linear-gradient(90deg,rgba(150,150,150,.1),rgba(150,150,150,.28) 55%,rgba(150,150,150,1))}
+  #lab{display:flex;justify-content:space-between;font-size:11px;opacity:.8;margin-top:2px}
+  .leaflet-popup-content{font:12px system-ui,sans-serif;max-width:340px}
+  .leaflet-popup-content b{color:#06c}
+</style></head><body>
+<div id="wrap">
+  <div id="feed">
+    <div id="filters">
+      <div class="row" id="typerow"></div>
+      <div class="tr">last <b><span id="hrsval">24</span>h</b>
+        <input id="hrs" type="range" min="1" max="24" step="1" value="24">
+        <span id="n">0</span></div>
+    </div>
+    <div id="list"></div>
+  </div>
+  <div id="map"></div>
+</div>
+<div id="hud">incident age (opacity)
+  <div id="bar"></div>
+  <div id="lab"><span>older</span><span>newer</span></div>
+</div>
+<script>
+var CAP = 8000;
+var map = L.map("map").setView([39, -98], 4);          // neutral default; auto-fits to data on first load
+L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+  {maxZoom:18, attribution:"&copy; OpenStreetMap"}).addTo(map);
+setTimeout(function(){ map.invalidateSize(); }, 200);
+window.addEventListener("resize", function(){ map.invalidateSize(); });
+
+var TYPES = ["medical","fire","vehicle","alarm","hazmat","other"];
+var COLOR = {medical:"#2f7be6", fire:"#e23b2e", vehicle:"#ff8c1a", alarm:"#9b30c0", hazmat:"#1aa64b", other:"#888888"};
+var LABEL = {medical:"med", fire:"fire", vehicle:"veh", alarm:"alarm", hazmat:"haz", other:"other"};
+function swatch(ty){   // colored circle matching the map markers
+  return "<svg width=15 height=15 viewBox=\"0 0 15 15\" style=\"vertical-align:middle\">"
+       + "<circle cx=7.5 cy=7.5 r=6.5 fill="+COLOR[ty]+" stroke=#333 stroke-width=1/></svg>";
+}
+// Incident-type classifier -- tuned for US fire/EMS dispatch codes; adjust for other feeds.
+function incidentType(b){
+  var code="", m=b.match(/>>\s*([A-Za-z]+)\d*\s*-/);
+  if(m){ code=m[1].toUpperCase(); }
+  else { m=b.match(/^\s*([A-Za-z][A-Za-z ]*?)\s*[-;]/); if(m) code=m[1].toUpperCase().trim(); }
+  if(/AFA|ALARM/.test(code)) return "alarm";
+  if(code.indexOf("MV")===0) return "vehicle";
+  if(/HAZ|^HZ$|GAS/.test(code)) return "hazmat";
+  if(/AID|MED|BLS|MEDIC|CARDIAC|RESC|STROKE|SICK/.test(code)) return "medical";
+  if(/FIRE|SMOKE|STRUCT|WORKING|BRUSH|BARK|APPLI|FOS|COA|^F[A-Z]{0,2}$/.test(code)) return "fire";
+  return "other";
+}
+var typerow=document.getElementById("typerow");
+TYPES.forEach(function(ty){
+  var lab=document.createElement("label");
+  lab.innerHTML="<input type=checkbox data-t="+ty+" checked>"+swatch(ty)+" "+LABEL[ty];
+  typerow.appendChild(lab);
+});
+
+var listEl=document.getElementById("list");
+var seen=new Set(), pts=[], fitted=false;
+var typeOn={medical:1,fire:1,vehicle:1,alarm:1,hazmat:1,other:1}, hoursBack=24;
+var manualMarker=null;   // marker the user manually opened; null => auto-follow active
+function esc(s){return s.replace(/[&<>]/g, function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;"}[c];});}
+function fmt(iso){var d=new Date(iso),z=function(x){return (x<10?"0":"")+x;};return d.getFullYear()+"-"+z(d.getMonth()+1)+"-"+z(d.getDate())+" "+z(d.getHours())+":"+z(d.getMinutes())+":"+z(d.getSeconds());}
+function visible(p){ return typeOn[p.type] && p.t >= Date.now()-hoursBack*3600000; }
+
+function recolor(){     // fill color = type; fill opacity = age (oldest .10, newest .90, exp ramp)
+  var mn=Infinity,mx=-Infinity,i,any=false;
+  for(i=0;i<pts.length;i++){ if(pts[i].shown){ any=true; if(pts[i].t<mn)mn=pts[i].t; if(pts[i].t>mx)mx=pts[i].t; } }
+  if(!any) return;
+  var span=Math.max(1,mx-mn);
+  for(i=0;i<pts.length;i++){ if(!pts[i].shown) continue;
+    var nn=(pts[i].t-mn)/span, op=0.1+0.8*Math.pow(nn,2);
+    pts[i].m.setStyle({fillColor:COLOR[pts[i].type], fillOpacity:op, color:"#333", opacity:op, weight:1});
+  }
+}
+function applyFilters(){
+  var shown=0;
+  for(var i=0;i<pts.length;i++){
+    var p=pts[i], v=visible(p);
+    if(v && !p.shown){ p.m.addTo(map); p.shown=true; }
+    else if(!v && p.shown){ map.removeLayer(p.m); p.shown=false; }
+    p.el.style.display = v ? "" : "none";
+    if(v) shown++;
+  }
+  document.getElementById("n").textContent = shown + " shown";
+  recolor();
+}
+function poll(){
+  fetch("/points").then(function(r){return r.json();}).then(function(arr){
+    var added=[];
+    for(var i=0;i<arr.length;i++){
+      var p=arr[i], k=p.ts+"|"+p.body;
+      if(seen.has(k)) continue;
+      seen.add(k);
+      var ty=incidentType(p.body);
+      var tt=fmt(p.ts);
+      var m=L.circleMarker([p.lat,p.lon],{radius:7,weight:1,color:"#333",fillColor:COLOR[ty],fillOpacity:0.8})
+            .addTo(map).bindPopup("<b>"+tt+"</b><br>"+esc(p.body));
+      m.on("click", function(){ manualMarker=this; });
+      m.on("popupclose", function(){ if(manualMarker===this) manualMarker=null; });
+      var el=document.createElement("div");
+      el.className="item"; el.style.borderLeftColor=COLOR[ty];
+      el.innerHTML="<div class=meta>"+swatch(ty)+" "+tt+"</div><div class=body>"+esc(p.body)+"</div>";
+      (function(mk,lat,lon){ el.onclick=function(){ manualMarker=mk; map.panTo([lat,lon]); mk.openPopup(); }; })(m,p.lat,p.lon);
+      listEl.insertBefore(el, listEl.firstChild);
+      var entry={m:m, t:Date.parse(p.ts), el:el, lat:p.lat, lon:p.lon, type:ty, shown:true};
+      pts.push(entry); added.push(entry);
+    }
+    while(pts.length && pts.length > CAP){ var o=pts.shift(); map.removeLayer(o.m); if(o.el.parentNode) o.el.parentNode.removeChild(o.el); }
+    applyFilters();
+    if(!fitted && pts.length){                   // auto-fit the map to the data on first load
+      var la=pts.map(function(p){return p.lat;}), lo=pts.map(function(p){return p.lon;});
+      map.fitBounds([[Math.min.apply(null,la),Math.min.apply(null,lo)],[Math.max.apply(null,la),Math.max.apply(null,lo)]],
+                    {padding:[30,30], maxZoom:12});
+      fitted=true;
+    }
+    if(!manualMarker && added.length){           // auto-follow the newest new (visible) incident
+      var nw=null, j;
+      for(j=0;j<added.length;j++){ if(added[j].shown && (!nw || added[j].t>nw.t)) nw=added[j]; }
+      if(nw){ map.panTo([nw.lat, nw.lon]); nw.m.openPopup(); }
+    }
+  }).catch(function(){});
+}
+document.querySelectorAll("#filters input[type=checkbox]").forEach(function(cb){
+  cb.onchange=function(){ typeOn[cb.getAttribute("data-t")]=cb.checked?1:0; applyFilters(); };
+});
+var hrs=document.getElementById("hrs");
+hrs.oninput=function(){ hoursBack=+hrs.value; document.getElementById("hrsval").textContent=hrs.value; applyFilters(); };
+poll();
+setInterval(poll, 5000);
+</script></body></html>

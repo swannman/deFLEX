@@ -20,7 +20,7 @@ that multimon renders as noise.
 - **Live multi-carrier, multi-protocol reception.** A harness tunes one SDR,
   channelizes the captured band, and runs the right decoder per carrier — one OS
   process each. A single frequency can be decoded as **both** FLEX and POCSAG (for
-  a channel that carries both). Feeds a web viewer.
+  a channel that carries both). Feeds a web text viewer and a live incident map.
 - **Pure numpy/scipy**, with an optional numba accelerator (bit-exact fallback).
 
 ## How it compares to `multimon-ng`
@@ -60,7 +60,8 @@ core/               importable library modules
   pocsag_core.py      POCSAG decoder + the live POCSAGStream wrapper
   receiver_core.py    shared decode-worker layer + log callbacks (no GNU Radio)
   receiver_sdr.py     SoapySDR source + channelization (the one GNU-Radio module)
-viewer/             web feed: tails the decode logs, streams to browsers
+viewer/             web text feed: tails the decode logs, streams to browsers
+viewer-map/         web incident map: geolocates dispatch pages onto a live map
 docs/               decoder.md (how decoding works), receiver.md (the live receiver)
 ```
 
@@ -97,5 +98,8 @@ python3 pocsag_receiver.py --live --freq 152.0075
 - **[`docs/receiver.md`](docs/receiver.md)** — the live SDR receiver: the
   overlapped-batch streaming model, the per-carrier multiprocessing design, the
   configuration parameters, and how to run it.
-- **[`viewer/README.md`](viewer/README.md)** — the web viewer that renders the
+- **[`viewer/README.md`](viewer/README.md)** — the web text viewer that renders the
   decoded feed.
+- **[`viewer-map/README.md`](viewer-map/README.md)** — the live incident map:
+  geolocates dispatch pages (embedded coords or geocoded address) onto a Leaflet
+  map with a filterable feed.

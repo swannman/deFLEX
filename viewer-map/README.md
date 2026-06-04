@@ -2,7 +2,7 @@
 
 A geographic companion to [`viewer/`](../viewer/) (the text feed). It reads the
 per-carrier logs the receivers write, locates each page, and serves a Leaflet map
-+ live, filterable incident feed.
+with a live, filterable incident feed.
 
 It's self-contained (Python stdlib only, no pip installs) and independent of the
 text viewer — run either, both, or neither.
